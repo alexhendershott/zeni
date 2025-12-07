@@ -1,0 +1,5 @@
+openai>=1.50.0
+pygame>=2.6.0
+sounddevice>=0.4.7
+soundfile>=0.12.1
+numpy>=1.26.0
