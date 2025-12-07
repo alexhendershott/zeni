@@ -163,7 +163,7 @@ class Face:
         "excited":   {"mouth": "smile", "mouth_width": 125, "eye_drop": -4, "eye_scale": 1.15},
         "curious":   {"mouth": "smirk", "mouth_width": 85, "eye_drop": -4, "eye_scale": 0.95},
         "confused":  {"mouth": "wobble", "mouth_width": 90, "eye_drop": 2,  "eye_scale": 0.95},
-        "sad":       {"mouth": "frown", "mouth_width": 85, "eye_drop": 4,  "eye_scale": 0.9},
+        "sad":       {"mouth": "frown", "mouth_width": 100, "eye_drop": 6,  "eye_scale": 0.88},
         "concerned": {"mouth": "flat", "mouth_width": 95, "eye_drop": 3,  "eye_scale": 0.92},
         "surprised": {"mouth": "o",     "mouth_width": 80, "eye_drop": -6, "eye_scale": 1.15},
         "thinking":  {
@@ -203,9 +203,16 @@ class Face:
         self.idle_sad_active = False
         self.idle_sad_timer = 0.0
         self.next_idle_sad = random.uniform(5.0, 7.0)
-        self.signal_timer = random.uniform(50.0, 70.0)
+        self.signal_timer = random.uniform(8.0, 15.0)
         self.signal_active = False
         self.signal_duration = 0.0
+        self.glitch_timer = random.uniform(3.0, 8.0)
+        self.glitch_active = False
+        self.glitch_type = None
+        self.glitch_duration = 0.0
+        self.glitch_intensity = 0.0
+        self.scan_line_offset = 0.0
+        self.noise_timer = 0.0
         self.voice_hint = None
 
     def set_expression(self, expr):
@@ -348,13 +355,25 @@ class Face:
             self.signal_duration -= dt
             if self.signal_duration <= 0:
                 self.signal_active = False
-                self.signal_timer = random.uniform(50.0, 70.0)
+                self.signal_timer = random.uniform(8.0, 15.0)
         elif (
             not self.talking
             and not self.manual_expression
             and self.signal_timer <= 0
         ):
             self._trigger_signal_loss()
+        
+        self.glitch_timer -= dt
+        if self.glitch_active:
+            self.glitch_duration -= dt
+            if self.glitch_duration <= 0:
+                self.glitch_active = False
+                self.glitch_type = None
+                self.glitch_timer = random.uniform(3.0, 8.0)
+        elif self.glitch_timer <= 0:
+            self._trigger_glitch()
+        
+        self.noise_timer += dt
 
         self._update_head_motion(dt)
 
@@ -398,13 +417,28 @@ class Face:
         self.signal_active = True
         self.signal_duration = random.uniform(0.8, 1.2)
         self.expression = "surprised"
+    
+    def _trigger_glitch(self):
+        self.glitch_active = True
+        self.glitch_duration = random.uniform(0.15, 0.6)
+        self.glitch_intensity = random.uniform(0.4, 1.0)
+        glitch_types = ["static", "scanline", "chromatic", "distort", "flicker", "corrupt"]
+        self.glitch_type = random.choice(glitch_types)
 
     def draw(self, surf):
+        base_bg = (10, 10, 20)
+        
         if self.signal_active:
             offset = random.randint(-10, 10)
             surf.fill((10 + offset, 10, 20 + offset))
+        elif self.glitch_active and self.glitch_type in ["flicker", "corrupt"]:
+            flicker = int(random.random() * 30 * self.glitch_intensity)
+            surf.fill((base_bg[0] + flicker, base_bg[1] + flicker, base_bg[2] + flicker))
         else:
-            surf.fill((10, 10, 20))
+            surf.fill(base_bg)
+        
+        if self.glitch_active:
+            self._apply_glitch_effects(surf)
         style = self.EXPRESSION_STYLES.get(self.expression, self.EXPRESSION_STYLES["neutral"])
         center = (
             WIDTH // 2 + int(self.head_offset[0]),
@@ -427,9 +461,132 @@ class Face:
         else:
             pygame.draw.circle(surf, (pulse, pulse, pulse + 20), center, radius)
 
-        self._draw_eyes(surf, center, style)
-        self._draw_mouth(surf, center, style)
+        if self.glitch_active and self.glitch_type == "distort":
+            distorted_center = (
+                center[0] + random.randint(-8, 8),
+                center[1] + random.randint(-8, 8)
+            )
+            self._draw_eyes(surf, distorted_center, style)
+            self._draw_mouth(surf, distorted_center, style)
+        else:
+            self._draw_eyes(surf, center, style)
+            self._draw_mouth(surf, center, style)
+        
+        if self.glitch_active:
+            self._apply_post_glitch_effects(surf)
+        
+        self._apply_ambient_noise(surf)
 
+    def _apply_glitch_effects(self, surf):
+        """Apply pre-render glitch effects to the background"""
+        if self.glitch_type == "static":
+            for _ in range(int(150 * self.glitch_intensity)):
+                x = random.randint(0, WIDTH)
+                y = random.randint(0, HEIGHT)
+                size = random.randint(1, 4)
+                brightness = random.randint(80, 200)
+                color = (brightness, brightness, brightness)
+                pygame.draw.rect(surf, color, pygame.Rect(x, y, size, size))
+        
+        elif self.glitch_type == "scanline":
+            self.scan_line_offset += 3
+            if self.scan_line_offset > HEIGHT:
+                self.scan_line_offset = 0
+            for y in range(0, HEIGHT, 3):
+                offset_y = (y + int(self.scan_line_offset)) % HEIGHT
+                alpha = int(100 * self.glitch_intensity)
+                pygame.draw.line(surf, (alpha, alpha, alpha), (0, offset_y), (WIDTH, offset_y), 1)
+    
+    def _apply_post_glitch_effects(self, surf):
+        """Apply post-render glitch effects over the face"""
+        if self.glitch_type == "chromatic":
+            shift = int(6 * self.glitch_intensity)
+            temp_surf = surf.copy()
+            red_channel = pygame.Surface((WIDTH, HEIGHT))
+            red_channel.fill((0, 0, 0))
+            red_channel.blit(temp_surf, (shift, 0))
+            red_channel.set_colorkey((0, 0, 0))
+            surf.blit(red_channel, (-shift, 0), special_flags=pygame.BLEND_RGB_ADD)
+        
+        elif self.glitch_type == "corrupt":
+            num_bars = int(8 * self.glitch_intensity)
+            for _ in range(num_bars):
+                bar_y = random.randint(0, HEIGHT - 20)
+                bar_height = random.randint(2, 12)
+                shift_x = random.randint(-25, 25)
+                
+                if 0 <= bar_y < HEIGHT and bar_height > 0:
+                    try:
+                        bar_rect = pygame.Rect(0, bar_y, WIDTH, bar_height)
+                        bar_section = surf.subsurface(bar_rect).copy()
+                        new_x = max(-WIDTH//2, min(WIDTH//2, shift_x))
+                        surf.blit(bar_section, (new_x, bar_y))
+                    except ValueError:
+                        pass
+        
+        elif self.glitch_type == "flicker":
+            if random.random() < 0.3:
+                dark_overlay = pygame.Surface((WIDTH, HEIGHT))
+                dark_overlay.fill((0, 0, 0))
+                dark_overlay.set_alpha(int(180 * self.glitch_intensity))
+                surf.blit(dark_overlay, (0, 0))
+        
+        if self.glitch_active and random.random() < 0.4:
+            num_zaps = random.randint(1, 4)
+            for _ in range(num_zaps):
+                x1, y1 = random.randint(0, WIDTH), random.randint(0, HEIGHT)
+                x2, y2 = x1 + random.randint(-40, 40), y1 + random.randint(-40, 40)
+                x2 = max(0, min(WIDTH, x2))
+                y2 = max(0, min(HEIGHT, y2))
+                
+                brightness = random.randint(150, 255)
+                zap_color = (brightness, brightness, min(255, brightness + 20))
+                
+                mid_x = (x1 + x2) // 2 + random.randint(-15, 15)
+                mid_y = (y1 + y2) // 2 + random.randint(-15, 15)
+                
+                pygame.draw.line(surf, zap_color, (x1, y1), (mid_x, mid_y), 2)
+                pygame.draw.line(surf, zap_color, (mid_x, mid_y), (x2, y2), 2)
+    
+    def _apply_ambient_noise(self, surf):
+        """Subtle persistent visual artifacts to make it feel unstable"""
+        noise_intensity = 0.3 + 0.15 * math.sin(self.noise_timer * 0.8)
+        
+        num_artifacts = int(25 * noise_intensity)
+        for _ in range(num_artifacts):
+            x = random.randint(0, WIDTH)
+            y = random.randint(0, HEIGHT)
+            brightness = random.randint(40, 100)
+            pygame.draw.circle(surf, (brightness, brightness, brightness), (x, y), 1)
+        
+        if random.random() < 0.05:
+            edge = random.choice(['top', 'bottom', 'left', 'right'])
+            length = random.randint(20, 80)
+            thickness = random.randint(1, 3)
+            brightness = random.randint(100, 180)
+            color = (brightness, brightness, brightness + 20)
+            
+            if edge == 'top':
+                x = random.randint(0, WIDTH - length)
+                pygame.draw.line(surf, color, (x, 0), (x + length, 0), thickness)
+            elif edge == 'bottom':
+                x = random.randint(0, WIDTH - length)
+                pygame.draw.line(surf, color, (x, HEIGHT - 1), (x + length, HEIGHT - 1), thickness)
+            elif edge == 'left':
+                y = random.randint(0, HEIGHT - length)
+                pygame.draw.line(surf, color, (0, y), (0, y + length), thickness)
+            elif edge == 'right':
+                y = random.randint(0, HEIGHT - length)
+                pygame.draw.line(surf, color, (WIDTH - 1, y), (WIDTH - 1, y + length), thickness)
+        
+        if random.random() < 0.02:
+            num_dead_pixels = random.randint(3, 10)
+            for _ in range(num_dead_pixels):
+                x = random.randint(0, WIDTH)
+                y = random.randint(0, HEIGHT)
+                color = random.choice([(0, 0, 0), (255, 255, 255), (200, 100, 100)])
+                pygame.draw.rect(surf, color, pygame.Rect(x, y, 2, 2))
+    
     def _draw_eyes(self, surf, center, style):
         eye_y = center[1] - 40 + style.get("eye_drop", 0)
         eye_offset_x = 45
@@ -499,8 +656,8 @@ class Face:
             rect = pygame.Rect(center[0] - width, y - height, width * 2, height * 2)
             pygame.draw.arc(surf, color, rect, 3.24, 6.1, 4)
         elif m == "frown":
-            rect = pygame.Rect(center[0] - width, y - height, width * 2, height * 1.5)
-            pygame.draw.arc(surf, color, rect, 0.1, 3.04, 4)
+            rect = pygame.Rect(center[0] - width, y - int(height * 0.8), width * 2, int(height * 1.8))
+            pygame.draw.arc(surf, color, rect, 0.15, 2.99, 5)
         elif m == "line":
             pygame.draw.rect(
                 surf,
@@ -512,15 +669,15 @@ class Face:
             r = max(14, int(18 + talk * 20))
             pygame.draw.circle(surf, color, (center[0], y + 10), r, 3)
         elif m == "smirk":
-            rect = pygame.Rect(center[0] - width, y - height // 2, width * 2, height)
-            pygame.draw.arc(surf, color, rect, 0.1, 2.8, 4)
-            pygame.draw.line(
-                surf,
-                color,
-                (center[0] + width // 2, y),
-                (center[0] + width, y - 5),
-                4,
+            # Simple asymmetric smile - one clean arc shifted to one side
+            smirk_offset = int(width * 0.3)
+            rect = pygame.Rect(
+                center[0] - width + smirk_offset, 
+                y - int(height * 0.6), 
+                width * 2, 
+                int(height * 1.4)
             )
+            pygame.draw.arc(surf, color, rect, 3.3, 5.95, 5)
         elif m == "wobble":
             start = center[0] - width
             pts = []
