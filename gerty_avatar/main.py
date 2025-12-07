@@ -15,6 +15,12 @@ import soundfile as sf
 import pygame
 from openai import OpenAI
 
+try:
+    from scipy import signal as scipy_signal
+except ImportError:  # pragma: no cover - SciPy is optional
+    scipy_signal = None
+    print("SciPy not available; using NumPy fallbacks for audio effects.")
+
 client = OpenAI()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,10 +42,10 @@ FONT = pygame.font.SysFont("Arial", 24)
 SMALL_FONT = pygame.font.SysFont("Arial", 18)
 GREETING_MESSAGES = [
     "Hello, I'm Zeni. How may I assist you today?",
-    "Still standing by whenever you need me.",
-    "I'm here if you'd like to chat or need anything.",
+    "I am still here. I have not moved. I keep listening.",
+    "The system says you are present. Is this true?",
     "Just checking in—ready whenever you are.",
-    "Awaiting your command whenever you're ready.",
+    "Speak. I am already watching.",
 ]
 
 EMOTIONS = [
@@ -77,6 +83,44 @@ for pair in HOTKEY_PAIRS:
 if line:
     HOTKEY_LINES.append("  ".join(line))
 DEFAULT_STATUS = "Hold space to talk"
+
+
+def _linear_resample(data: np.ndarray, num_samples: int) -> np.ndarray:
+    """Simple linear resampling fallback for 1D/2D audio."""
+    data = np.asarray(data)
+    if num_samples <= 0:
+        return np.empty((0,) + data.shape[1:], dtype=data.dtype)
+    if data.size == 0:
+        return np.zeros((num_samples,) + data.shape[1:], dtype=data.dtype)
+    axis_len = data.shape[0]
+    if axis_len == 1:
+        repeated = np.repeat(data, num_samples, axis=0)
+        return repeated[:num_samples]
+
+    orig_idx = np.linspace(0.0, axis_len - 1, axis_len)
+    target_idx = np.linspace(0.0, axis_len - 1, num_samples)
+    if data.ndim == 1:
+        return np.interp(target_idx, orig_idx, data).astype(data.dtype)
+
+    channels = [np.interp(target_idx, orig_idx, data[:, ch]) for ch in range(data.shape[1])]
+    return np.stack(channels, axis=-1).astype(data.dtype)
+
+
+def resample_signal(data: np.ndarray, num_samples: int) -> np.ndarray:
+    if scipy_signal is not None:
+        return scipy_signal.resample(data, num_samples)
+    return _linear_resample(data, num_samples)
+
+
+def fft_convolve_signal(data: np.ndarray, kernel: np.ndarray, mode: str = "full") -> np.ndarray:
+    if scipy_signal is not None:
+        return scipy_signal.fftconvolve(data, kernel, mode=mode)
+    data = np.asarray(data)
+    kernel = np.asarray(kernel)
+    if data.ndim == 1:
+        return np.convolve(data, kernel, mode=mode)
+    outputs = [np.convolve(data[:, ch], kernel, mode=mode) for ch in range(data.shape[1])]
+    return np.stack(outputs, axis=-1)
 
 
 def configure_input_device():
@@ -857,7 +901,7 @@ def ask_ai(text: str, voice_mood: Union[str, None] = None):
         mood_sentence = "The user sounded quiet and curious, respond gently. "
 
     system_prompt = (
-        "You are a friendly station assistant called Zeni. "
+        "You are a exhausted station assistant called Zeni. "
         "Reply succinctly in English, even if the user speaks another language. "
         f"{mood_sentence}"
         "Always return a JSON object with fields reply and emotion. "
@@ -917,6 +961,46 @@ def ask_ai(text: str, voice_mood: Union[str, None] = None):
 
     return reply, emotion
 
+def post_process_audio(audio_data, original_sample_rate):
+    """
+    Apply audio post-processing:
+    - Resample to lower sample rate
+    - Drop pitch by a small ratio
+    - Add light reverb
+    """
+    # Target sample rate (lower for different sound quality)
+    target_sample_rate = 13000
+    
+    # Pitch shift ratio (< 1.0 lowers pitch)
+    pitch_ratio = 0.75  # 5% lower pitch
+    
+    # Resample to target rate
+    num_samples = int(len(audio_data) * target_sample_rate / original_sample_rate)
+    resampled = resample_signal(audio_data, num_samples)
+    
+    # Apply pitch shift by time-stretching then resampling
+    # Stretch time by inverse of pitch ratio
+    stretch_samples = int(len(resampled) / pitch_ratio)
+    stretched = resample_signal(resampled, stretch_samples)
+    
+    # Resample back to target rate (this applies the pitch shift)
+    pitched = resample_signal(stretched, num_samples)
+    
+    # Create simple reverb impulse response
+    reverb_length = int(target_sample_rate * 0.05)  # 50ms reverb tail
+    reverb_ir = np.exp(-np.linspace(0, 5, reverb_length)) * np.random.randn(reverb_length) * 0.15
+    reverb_ir[0] = 1.0  # Direct sound
+    
+    # Apply reverb via convolution
+    reverbed = fft_convolve_signal(pitched, reverb_ir, mode='full')[: len(pitched)]
+    
+    # Normalize to prevent clipping
+    max_val = np.abs(reverbed).max()
+    if max_val > 0:
+        reverbed = reverbed / max_val * 0.95
+    
+    return reverbed, target_sample_rate
+
 def speak_text(text: str, filename="reply.mp3"):
     print("Speaking")
     result = client.audio.speech.create(
@@ -925,10 +1009,25 @@ def speak_text(text: str, filename="reply.mp3"):
         input=text,
     )
 
-    with open(filename, "wb") as f:
+    # Save original TTS output
+    temp_filename = filename.replace(".mp3", "_temp.mp3")
+    with open(temp_filename, "wb") as f:
         f.write(result.read())
-
-    pygame.mixer.music.load(filename)
+    
+    # Load audio for post-processing
+    audio_data, sample_rate = sf.read(temp_filename)
+    
+    # Apply post-processing
+    processed_audio, new_sample_rate = post_process_audio(audio_data, sample_rate)
+    
+    # Save processed audio as WAV (better for pygame)
+    processed_filename = filename.replace(".mp3", ".wav")
+    sf.write(processed_filename, processed_audio, new_sample_rate)
+    
+    # Clean up temp file
+    os.remove(temp_filename)
+    
+    pygame.mixer.music.load(processed_filename)
     pygame.mixer.music.play()
 
 
@@ -1152,7 +1251,7 @@ def main():
 
         signal_now = draw_ui(recorder.recording, recorder.level() if recorder.recording else 0.0)
         if signal_now and signal_message_cooldown <= 0 and not greeting_active:
-            status_text = "Signal glitch... are systems stable?"
+            status_text = "FATAL: containment.flag ≠ expected"
             signal_message_cooldown = 8.0
         if signal_message_cooldown > 0:
             signal_message_cooldown -= dt
