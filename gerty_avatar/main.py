@@ -1,5 +1,6 @@
 import os
-from typing import Union
+import base64
+from typing import Union, Optional
 import json
 import time
 import threading
@@ -1605,6 +1606,7 @@ class GazeTracker:
             "eye_contact_frames": 0,
             "events": defaultdict(int),
         }
+        self._latest_frame = None
 
         self.eye_contact = False
         self.contact_start = None
@@ -1709,6 +1711,14 @@ class GazeTracker:
                 "eye_contact": self.eye_contact,
             }
 
+    def get_frame(self) -> Optional[np.ndarray]:
+        if not self.enabled:
+            return None
+        with self._lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame.copy()
+
     def _push_event(self, event):
         event["ts"] = time.time()
         with self._lock:
@@ -1725,6 +1735,8 @@ class GazeTracker:
                 time.sleep(self.frame_interval)
                 continue
 
+            with self._lock:
+                self._latest_frame = frame.copy()
             self.frame_height, self.frame_width = frame.shape[:2]
             with self._lock:
                 self._debug_stats["frames"] += 1
@@ -1947,6 +1959,7 @@ class LandmarkGazeTracker:
         self.yaw_history = deque(maxlen=120)
         self.last_nod_event = 0.0
         self.last_shake_event = 0.0
+        self._latest_frame = None
 
         if self.enabled:
             self._setup_camera()
@@ -2016,6 +2029,14 @@ class LandmarkGazeTracker:
                 "engagement": self.engagement_ema,
             }
 
+    def get_frame(self) -> Optional[np.ndarray]:
+        if not self.enabled:
+            return None
+        with self._lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame.copy()
+
     def _push_event(self, event):
         event["ts"] = time.time()
         with self._lock:
@@ -2032,6 +2053,8 @@ class LandmarkGazeTracker:
                 time.sleep(self.frame_interval)
                 continue
 
+            with self._lock:
+                self._latest_frame = frame.copy()
             self.frame_height, self.frame_width = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             result = self._mesh.process(rgb)
@@ -2413,6 +2436,58 @@ def ask_ai(text: str, voice_mood: Union[str, None] = None):
 
     return reply, emotion
 
+def _encode_frame_to_data_url(frame: np.ndarray) -> str:
+    if cv2 is None:
+        raise RuntimeError("OpenCV not available; cannot encode frame")
+    if frame is None or not hasattr(frame, "shape") or frame.size == 0:
+        raise ValueError("Empty frame provided")
+    ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok:
+        raise RuntimeError("Failed to encode frame to JPEG")
+    b64 = base64.b64encode(buffer.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def describe_scene_from_frame(frame: np.ndarray) -> str:
+    """
+    Send a camera frame to the vision model and return a concise room description.
+    """
+    data_url = _encode_frame_to_data_url(frame)
+    prompt = (
+        "You see a single camera frame. "
+        "Briefly describe the room: mention key objects or furniture and where they sit "
+        "relative to the camera (left/center/right/near/far). "
+        "Note if any people are visible. Keep it to 1-2 short sentences."
+    )
+    request_args = {
+        "model": "gpt-4o-mini",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }
+        ],
+        "max_output_tokens": 120,
+    }
+    try:
+        resp = client.responses.create(**request_args)
+    except TypeError:
+        request_args.pop("max_output_tokens", None)
+        resp = client.responses.create(**request_args)
+
+    content = ""
+    for message in getattr(resp, "output", []):
+        for block in getattr(message, "content", []):
+            if hasattr(block, "text"):
+                content += block.text
+    description = content.strip()
+    if not description:
+        raise RuntimeError("No description returned from vision model")
+    return description
+
 def post_process_audio(audio_data, original_sample_rate):
     """
     Apply audio post-processing:
@@ -2453,32 +2528,30 @@ def post_process_audio(audio_data, original_sample_rate):
     
     return reverbed, target_sample_rate
 
-def speak_text(text: str, filename="reply.mp3"):
+def speak_text(text: str, filename="reply.mp3", stop_current=True):
     print("Speaking")
+    try:
+        if stop_current:
+            pygame.mixer.music.stop()
+    except Exception:
+        pass
+
     result = client.audio.speech.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
         input=text,
     )
 
-    # Save original TTS output
     temp_filename = filename.replace(".mp3", "_temp.mp3")
     with open(temp_filename, "wb") as f:
         f.write(result.read())
     
-    # Load audio for post-processing
     audio_data, sample_rate = sf.read(temp_filename)
-    
-    # Apply post-processing
     processed_audio, new_sample_rate = post_process_audio(audio_data, sample_rate)
-    
-    # Save processed audio as WAV (better for pygame)
     processed_filename = filename.replace(".mp3", ".wav")
     sf.write(processed_filename, processed_audio, new_sample_rate)
-    
-    # Clean up temp file
     os.remove(temp_filename)
-    
+
     pygame.mixer.music.load(processed_filename)
     pygame.mixer.music.play()
 
@@ -2609,6 +2682,7 @@ def main():
     if "OPENAI_API_KEY" not in os.environ:
         raise RuntimeError("Set OPENAI_API_KEY in your environment")
 
+    session_start = time.time()
     configure_input_device()
 
     try:
@@ -2637,6 +2711,16 @@ def main():
 
     face = Face()
     dreams = DreamMonologue(face)
+    try:
+        no_face_timeout = float(os.getenv("NO_FACE_TIMEOUT", "15.0"))
+    except ValueError:
+        no_face_timeout = 15.0
+    try:
+        no_face_cooldown = float(os.getenv("NO_FACE_COOLDOWN", "150.0"))
+    except ValueError:
+        no_face_cooldown = 150.0
+    last_scene_trigger = 0.0
+    scene_thread = None
     if passive:
         face.set_proximity_zone(passive.zone)
     running = True
@@ -2661,6 +2745,10 @@ def main():
     talking_paused_for_gaze = False
     lookaway_prompt_active = False
     turn_abort = threading.Event()
+    no_face_elapsed = 0.0
+    scene_state_msg = None
+    scene_playback_active = False
+    pending_scene_request = False
 
     def mark_activity():
         nonlocal last_user_interaction
@@ -2668,6 +2756,10 @@ def main():
         if idle_gap > 2.0:
             dreams.snap_out()
         last_user_interaction = time.time()
+
+    def log_scene(msg: str):
+        ts = time.time() - session_start
+        print(f"[scene {ts:6.2f}s] {msg}")
 
     def pick_prethought_fragment(reply_text: str):
         tokens = [w.strip(".,!?;:") for w in reply_text.split() if w.strip(".,!?;:")]
@@ -2700,6 +2792,83 @@ def main():
             "offset": (random.randint(-24, 24), random.randint(-12, 12)),
             "alpha": random.randint(160, 230),
         }
+
+    def wants_room_description(text: str) -> bool:
+        lower = text.lower()
+        keywords = [
+            "describe the room",
+            "describe room",
+            "describe around me",
+            "what's around me",
+            "what is around me",
+            "what do you see",
+            "what can you see",
+            "describe my surroundings",
+            "what's in the room",
+            "what is in the room",
+        ]
+        return any(kw in lower for kw in keywords)
+
+    def capture_latest_frame():
+        if not vision or not getattr(vision, "enabled", False):
+            return None
+        getter = getattr(vision, "get_frame", None)
+        if not getter:
+            return None
+        try:
+            return getter()
+        except Exception as exc:
+            print("Failed to grab frame from vision:", exc)
+            return None
+
+    def launch_room_description(reason="auto"):
+        nonlocal scene_thread, last_scene_trigger, status_text, pending_scene_request
+        if scene_thread is not None and scene_thread.is_alive():
+            pending_scene_request = True
+            log_scene(f"Room describe queued ({reason}); worker busy")
+            return False
+        frame = capture_latest_frame()
+        last_scene_trigger = time.time()
+
+        def worker():
+            nonlocal status_text, scene_playback_active
+            if frame is None:
+                status_text = "Vision frame unavailable"
+                log_scene("Room describe aborted: no frame available")
+                return
+            mark_activity()
+            status_text = "Scanning surroundings..."
+            face.preview_expression("thinking", duration=1.4)
+            try:
+                description = describe_scene_from_frame(frame)
+            except Exception as exc:
+                print("Room description failed:", exc)
+                status_text = "Vision describe failed"
+                log_scene(f"Room describe failed: {exc}")
+                return
+            log_scene(f"Room describe ok: {description[:80]}")
+            face.set_talking(True)
+            scene_playback_active = True
+            try:
+                speak_text(description, filename="scene_reply.mp3")
+                # If playback never starts, log and bail early
+                start_wait = time.time()
+                while time.time() - start_wait < 1.0 and not pygame.mixer.music.get_busy():
+                    time.sleep(0.05)
+                if not pygame.mixer.music.get_busy():
+                    log_scene("Room describe playback did not start")
+                else:
+                    while pygame.mixer.music.get_busy() and running:
+                        time.sleep(0.05)
+            finally:
+                face.set_talking(False)
+                face.set_expression("neutral")
+                status_text = DEFAULT_STATUS
+                scene_playback_active = False
+
+        scene_thread = threading.Thread(target=worker, daemon=True)
+        scene_thread.start()
+        return True
 
     def draw_ui(show_meter=False, level=0.0):
         face.input_level = level
@@ -2783,6 +2952,7 @@ def main():
         nonlocal last_audio_path
         nonlocal lookaway_interrupt
         nonlocal turn_abort
+        nonlocal pending_scene_request
         try:
             turn_abort.clear()
             lookaway_interrupt = False
@@ -2811,6 +2981,19 @@ def main():
             if turn_abort.is_set():
                 status_text = "Interrupted"
                 face.set_expression("neutral")
+                return
+
+            if wants_room_description(transcript):
+                log_scene("Manual room describe request")
+                if not vision or not getattr(vision, "enabled", False):
+                    status_text = "Vision disabled"
+                    face.set_expression("sad")
+                    return
+                status_text = "Describing room..."
+                started = launch_room_description(reason="manual")
+                if not started:
+                    pending_scene_request = True
+                    status_text = "Room describe queued..."
                 return
 
             status_text = "Thinking"
@@ -3093,7 +3276,7 @@ def main():
                 face.passive_timer = 0.6
             elif etype == "mouth_activity":
                 active = bool(evt.get("active", False))
-                if active:
+                if active and not scene_playback_active:
                     if pygame.mixer.music.get_busy() and not speech_paused_by_gaze:
                         pygame.mixer.music.pause()
                         speech_paused_by_gaze = True
@@ -3119,7 +3302,60 @@ def main():
                 face.passive_target = [random.choice([-12.0, 12.0]), random.uniform(-4.0, 6.0)]
                 face.passive_timer = 0.6
 
-        if vision and pygame.mixer.music.get_busy() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active:
+        now = time.time()
+        last_seen_ts = current_gaze_state.get("last_seen") or 0.0
+        face_recent = last_seen_ts > 0.0 and (now - last_seen_ts) < 0.6
+        if face_recent:
+            no_face_elapsed = 0.0
+        else:
+            no_face_elapsed += dt
+
+        scene_busy = scene_thread is not None and scene_thread.is_alive()
+        can_describe_room = (
+            vision
+            and getattr(vision, "enabled", False)
+            and not recorder.recording
+            and not face.talking
+            and not pygame.mixer.music.get_busy()
+            and (worker_thread is None or not worker_thread.is_alive())
+            and not greeting_active
+        )
+        if (
+            can_describe_room
+            and not scene_busy
+            and no_face_elapsed >= no_face_timeout
+            and (now - last_scene_trigger) >= no_face_cooldown
+        ):
+            no_face_elapsed = 0.0
+            log_scene("Triggering room description")
+            launch_room_description()
+        elif pending_scene_request and can_describe_room and not scene_busy:
+            pending_scene_request = False
+            log_scene("Launching queued room description")
+            launch_room_description(reason="queued")
+        else:
+            state_reason = "idle"
+            if not vision or not getattr(vision, "enabled", False):
+                state_reason = "disabled: vision off"
+            elif scene_busy:
+                state_reason = "waiting: scene thread active"
+            elif recorder.recording:
+                state_reason = "blocked: recording"
+            elif face.talking or pygame.mixer.music.get_busy() or (worker_thread is not None and worker_thread.is_alive()) or greeting_active:
+                state_reason = "blocked: busy speaking/thinking"
+            elif (now - last_scene_trigger) < no_face_cooldown:
+                state_reason = f"cooldown {no_face_cooldown - (now - last_scene_trigger):.1f}s"
+            elif face_recent:
+                state_reason = "face seen, timer reset"
+            elif pending_scene_request:
+                state_reason = "queued: waiting to describe"
+            else:
+                state_reason = f"counting: {no_face_elapsed:.1f}/{no_face_timeout:.1f}s"
+            if state_reason != scene_state_msg:
+                scene_state_msg = state_reason
+                log_scene(state_reason)
+
+        if vision and pygame.mixer.music.get_busy() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active and not scene_playback_active:
             interrupt_for_lookaway()
 
         if not passive and gaze_state:
@@ -3138,18 +3374,20 @@ def main():
                 talking_paused_for_gaze = False
                 speech_pause_started = None
             elif time.time() - speech_pause_started > 8.0:
-                pygame.mixer.music.stop()
-                face.set_talking(False)
-                speech_paused_by_gaze = False
-                talking_paused_for_gaze = False
-                speech_pause_started = None
-                status_text = "Stopped: eye contact lost"
+                if not scene_playback_active:
+                    pygame.mixer.music.stop()
+                    face.set_talking(False)
+                    speech_paused_by_gaze = False
+                    talking_paused_for_gaze = False
+                    speech_pause_started = None
+                    status_text = "Stopped: eye contact lost"
 
         busy = (
             recorder.recording
             or face.talking
             or pygame.mixer.music.get_busy()
             or greeting_active
+            or scene_busy
             or (worker_thread is not None and worker_thread.is_alive())
         )
         dreams.update(dt, idle_time, allow_idle=not busy)
