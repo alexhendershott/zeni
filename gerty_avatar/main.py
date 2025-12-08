@@ -244,6 +244,7 @@ class Face:
         self.head_offset = [0.0, 0.0]
         self.head_target = [0.0, 0.0]
         self.head_timer = 0.0
+        self.listening = False
         self.idle_sad_elapsed = 0.0
         self.idle_sad_active = False
         self.idle_sad_timer = 0.0
@@ -546,11 +547,29 @@ class Face:
 
     def draw(self, surf):
         base_bg = (10, 10, 20)
-        
+
         if self.signal_active:
-            offset = random.randint(-10, 10)
-            surf.fill((10 + offset, 10, 20 + offset))
-        elif self.glitch_active and self.glitch_type in ["flicker", "corrupt"]:
+            surf.fill((0, 0, 0))
+            size = int(HEIGHT * 0.6)
+            rect = pygame.Rect(
+                WIDTH // 2 - size // 2,
+                HEIGHT // 2 - size // 2,
+                size,
+                size,
+            )
+            border = (230, 230, 240)
+            pygame.draw.rect(surf, border, rect, 4)
+
+            inner = rect.inflate(-30, -120)
+            pygame.draw.rect(surf, border, inner, 2)
+
+            bar_h = inner.height // 3
+            bar = pygame.Rect(inner.left, inner.centery - bar_h // 2, inner.width, bar_h)
+            pygame.draw.rect(surf, border, bar)
+
+            return
+        
+        if self.glitch_active and self.glitch_type in ["flicker", "corrupt"]:
             flicker = int(random.random() * 30 * self.glitch_intensity)
             surf.fill((base_bg[0] + flicker, base_bg[1] + flicker, base_bg[2] + flicker))
         else:
@@ -577,6 +596,24 @@ class Face:
         pulse_speed = 3.2 if self.talking else 1.6
         pulse = base + int(22 * (0.5 + 0.5 * math.sin(self.talk_timer * pulse_speed + self.talk_phase)))
         pulse = max(20, min(90, pulse))
+
+        if self.listening:
+            # dim base
+            surf.fill((5, 5, 10))
+            # central listening core
+            center = (WIDTH // 2 + int(self.head_offset[0]), HEIGHT // 2 + int(self.head_offset[1]))
+            r = 40 + int(60 * min(1.0, self.input_level * 6.0))
+            intensity = int(80 + 150 * min(1.0, self.input_level * 6.0))
+            core = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            pygame.draw.circle(core, (intensity, intensity, intensity + 40, 190), center, r)
+            pygame.draw.circle(core, (intensity + 40, intensity + 40, intensity + 90, 120), center, r + 20, 4)
+            core.set_alpha(160)
+            surf.blit(core, (0, 0))
+
+            # extra static sculpting comes from _apply_ambient_noise
+            self._apply_ambient_noise(surf)
+            self.previous_frame = surf.copy()
+            return
 
         self._draw_shadow_face(surf, shadow_center, shadow_style, radius)
 
@@ -1210,6 +1247,35 @@ def play_last_input(audio_path=INPUT_WAV):
     sound.play()
     return True
 
+
+def make_confirmation_chirp():
+    init = pygame.mixer.get_init()
+    if not init:
+        return None
+    sample_rate, _, channels = init
+    duration = 0.14
+    samples = int(sample_rate * duration)
+    t = np.linspace(0.0, duration, samples, endpoint=False)
+
+    f0, f1 = 520.0, 1240.0
+    sweep = f0 + (f1 - f0) * (t / duration)
+    envelope = np.exp(-t * 12.0) * (0.25 + 0.75 * t / duration)
+    wobble = 0.2 * np.sin(2 * math.pi * 18 * t)
+    tone = np.sin(2 * math.pi * sweep * t + wobble)
+    overtone = 0.35 * np.sin(2 * math.pi * (sweep * 1.8) * t)
+    signal = envelope * (tone + overtone)
+    signal = np.clip(signal * 28000, -32767, 32767).astype(np.int16)
+
+    if channels > 1:
+        signal = np.repeat(signal[:, None], channels, axis=1)
+    else:
+        signal = signal[:, None]
+
+    try:
+        return pygame.sndarray.make_sound(signal)
+    except pygame.error:
+        return None
+
 def main():
     if "OPENAI_API_KEY" not in os.environ:
         raise RuntimeError("Set OPENAI_API_KEY in your environment")
@@ -1219,6 +1285,9 @@ def main():
     face = Face()
     running = True
     status_text = DEFAULT_STATUS
+    confirmation_sound = make_confirmation_chirp()
+    if confirmation_sound:
+        confirmation_sound.set_volume(0.35)
 
     recorder = AudioRecorder()
     worker_thread = None
@@ -1233,6 +1302,7 @@ def main():
 
     def draw_ui(show_meter=False, level=0.0):
         face.input_level = level
+        face.listening = show_meter
         face.draw(screen)
 
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -1252,18 +1322,6 @@ def main():
         if tint[3] > 0:
             overlay.fill(tint)
             screen.blit(overlay, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-
-        if show_meter:
-            max_width = WIDTH - 40
-            rect = pygame.Rect(20, HEIGHT - 70, max_width, 10)
-            pygame.draw.rect(screen, (80, 80, 110), rect, 1)
-            filled = int(max_width * min(level / 0.5, 1.0))
-            if filled > 0:
-                pygame.draw.rect(
-                    screen,
-                    (80, 200, 255),
-                    pygame.Rect(rect.left, rect.top, filled, rect.height),
-                )
 
         text_surface = FONT.render(status_text, True, (220, 220, 240))
         screen.blit(text_surface, (20, HEIGHT - 40))
@@ -1390,6 +1448,8 @@ def main():
                         status_text = "Busy finishing previous reply"
                     else:
                         if not recorder.recording:
+                            if confirmation_sound:
+                                confirmation_sound.play()
                             recorder.start()
                             face.set_expression("thinking")
                             status_text = "Listening... release space"
