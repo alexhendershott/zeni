@@ -48,6 +48,7 @@ INPUT_DEVICE_PREF = os.getenv("AUDIO_INPUT_DEVICE")
 
 WIDTH = 640
 HEIGHT = 480
+DEFAULT_FACE_SCAN_INTERVAL = 30.0
 
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -2503,6 +2504,78 @@ def describe_scene_from_frame(frame: np.ndarray) -> str:
         raise RuntimeError("No description returned from vision model")
     return description
 
+def _prep_face_variants(frame: np.ndarray) -> list:
+    variants = []
+    if frame is None:
+        return variants
+    variants.append(("orig", frame))
+    if cv2 is not None:
+        try:
+            brighter = cv2.convertScaleAbs(frame, alpha=1.35, beta=24)
+            variants.append(("bright", brighter))
+            h, w = brighter.shape[:2]
+            crop_w = max(40, int(w * 0.65))
+            crop_h = max(40, int(h * 0.65))
+            x0 = max(0, (w - crop_w) // 2)
+            y0 = max(0, (h - crop_h) // 2)
+            crop = brighter[y0 : y0 + crop_h, x0 : x0 + crop_w]
+            variants.append(("center_crop", crop))
+        except Exception:
+            pass
+    return variants
+
+
+def describe_face_from_frame(frame: np.ndarray) -> str:
+    """
+    Send one or more variants of a camera frame to the vision model and return a concise face/outfit description.
+    """
+    variants = _prep_face_variants(frame)
+    if not variants:
+        raise RuntimeError("No frame available for face description")
+
+    prompt = (
+        "You see a webcam frame. "
+        "If any person/face is visible (even partially or dimly), assume they are the subject and describe them in one short clause: "
+        "are they smiling or not, how their eyes look (tired/wide/closed), and what they are wearing (color + garment). "
+        "Keep it under 22 words. "
+        "Only reply exactly 'No face detected' if there is clearly no person/face at all."
+    )
+
+    last_description = None
+    for tag, img in variants:
+        data_url = _encode_frame_to_data_url(img)
+        request_args = {
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url},
+                    ],
+                }
+            ],
+            "max_output_tokens": 120,
+        }
+        try:
+            resp = client.responses.create(**request_args)
+        except TypeError:
+            request_args.pop("max_output_tokens", None)
+            resp = client.responses.create(**request_args)
+
+        content = ""
+        for message in getattr(resp, "output", []):
+            for block in getattr(message, "content", []):
+                if hasattr(block, "text"):
+                    content += block.text
+        description = content.strip()
+        last_description = description or last_description
+        if description and description.lower() != "no face detected":
+            return description
+    if not last_description:
+        raise RuntimeError("No face description returned from vision model")
+    return last_description
+
 def post_process_audio(audio_data, original_sample_rate):
     """
     Apply audio post-processing:
@@ -2775,6 +2848,14 @@ def main():
     scene_state_msg = None
     scene_playback_active = False
     pending_scene_request = False
+    try:
+        face_scan_interval = float(os.getenv("FACE_SCAN_INTERVAL", str(DEFAULT_FACE_SCAN_INTERVAL)))
+    except ValueError:
+        face_scan_interval = DEFAULT_FACE_SCAN_INTERVAL
+    face_scan_thread = None
+    face_scan_active = False
+    pending_face_scan = False
+    last_face_scan = time.time()
 
     def mark_activity():
         nonlocal last_user_interaction
@@ -2905,8 +2986,102 @@ def main():
         scene_thread.start()
         return True
 
+    def launch_face_scan(reason="auto"):
+        nonlocal face_scan_thread, last_face_scan, status_text, pending_face_scan, face_scan_active
+        nonlocal scene_state_msg
+        if face_scan_thread is not None and face_scan_thread.is_alive():
+            pending_face_scan = True
+            log_scene(f"Face describe queued ({reason}); worker busy")
+            return False
+        frame = capture_latest_frame()
+        if frame is None:
+            status_text = "Vision frame unavailable"
+            log_scene("Face describe aborted: no frame available")
+            return False
+        last_face_scan = time.time()
+
+        def worker():
+            nonlocal status_text, face_scan_active, face_scan_thread, scene_state_msg
+            face_scan_active = True
+            mark_activity()
+            status_text = "Studying your face..."
+            face.preview_expression("confused", duration=1.2)
+            description = None
+            attempts = 0
+            current_frame = frame
+
+            while attempts < 3:
+                attempts += 1
+                try:
+                    description = describe_face_from_frame(current_frame)
+                except Exception as exc:
+                    print(f"Face description attempt {attempts} failed:", exc)
+                    description = None
+                face_seen_age = time.time() - (current_gaze_state.get("last_seen") or 0.0)
+                shape = getattr(current_frame, "shape", None)
+                log_scene(f"Face describe attempt {attempts} shape={shape} last_seen_age={face_seen_age:.2f}s result={description!r}")
+                if description and description.strip().lower() != "no face detected":
+                    break
+                fresh = capture_latest_frame()
+                if fresh is None:
+                    break
+                current_frame = fresh
+            if not description:
+                status_text = "Face describe failed"
+                face_scan_active = False
+                face_scan_thread = None
+                return
+            if description.strip().lower() == "no face detected":
+                status_text = "No face detected"
+                face_scan_active = False
+                face_scan_thread = None
+                return
+            creepy_line = (
+                "You look a little rough today. "
+                f"{description.rstrip('.')}. I see you even when you try not to be seen."
+            )
+            log_scene(f"Face describe ok ({reason}): {description[:80]}")
+            face.set_talking(True)
+            try:
+                started = speak_text(creepy_line, filename="face_scan.mp3")
+                if not started:
+                    status_text = "Face audio failed to start"
+                else:
+                    while pygame.mixer.music.get_busy() and running:
+                        time.sleep(0.05)
+            finally:
+                face.set_talking(False)
+                face.set_expression("neutral")
+                status_text = DEFAULT_STATUS
+                face_scan_active = False
+                face_scan_thread = None
+                scene_state_msg = None
+
+        pending_face_scan = False
+        face_scan_active = True
+        face_scan_thread = threading.Thread(target=worker, daemon=True)
+        face_scan_thread.start()
+        return True
+
     def is_actively_speaking():
         return face.talking or pygame.mixer.music.get_busy()
+
+    def vision_task_available():
+        busy_worker = worker_thread is not None and worker_thread.is_alive()
+        scene_busy = scene_thread is not None and scene_thread.is_alive()
+        return (
+            vision
+            and getattr(vision, "enabled", False)
+            and not recorder.recording
+            and not face.talking
+            and not pygame.mixer.music.get_busy()
+            and not greeting_active
+            and not lookaway_prompt_active
+            and not face_scan_active
+            and not scene_playback_active
+            and not scene_busy
+            and not busy_worker
+        )
 
     def draw_ui(show_meter=False, level=0.0):
         face.input_level = level
@@ -3358,15 +3533,14 @@ def main():
             no_face_elapsed += dt
 
         scene_busy = scene_thread is not None and scene_thread.is_alive()
-        can_describe_room = (
-            vision
-            and getattr(vision, "enabled", False)
-            and not recorder.recording
-            and not face.talking
-            and not pygame.mixer.music.get_busy()
-            and (worker_thread is None or not worker_thread.is_alive())
-            and not greeting_active
-        )
+        face_scan_busy = face_scan_thread is not None and face_scan_thread.is_alive()
+
+        if not face_scan_active and not face_scan_busy and (now - last_face_scan) >= face_scan_interval:
+            pending_face_scan = True
+
+        vision_ready = vision_task_available()
+
+        can_describe_room = vision_ready
         if (
             can_describe_room
             and not scene_busy
@@ -3388,7 +3562,7 @@ def main():
                 state_reason = "waiting: scene thread active"
             elif recorder.recording:
                 state_reason = "blocked: recording"
-            elif face.talking or pygame.mixer.music.get_busy() or (worker_thread is not None and worker_thread.is_alive()) or greeting_active:
+            elif face.talking or pygame.mixer.music.get_busy() or (worker_thread is not None and worker_thread.is_alive()) or greeting_active or face_scan_active:
                 state_reason = "blocked: busy speaking/thinking"
             elif (now - last_scene_trigger) < no_face_cooldown:
                 state_reason = f"cooldown {no_face_cooldown - (now - last_scene_trigger):.1f}s"
@@ -3401,6 +3575,18 @@ def main():
             if state_reason != scene_state_msg:
                 scene_state_msg = state_reason
                 log_scene(state_reason)
+
+        if (
+            pending_face_scan
+            and vision_ready
+            and face_recent
+            and not scene_busy
+            and not face_scan_busy
+        ):
+            pending_face_scan = False
+            launched = launch_face_scan(reason="scheduled")
+            if not launched:
+                pending_face_scan = True
 
         if vision and is_actively_speaking() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active and not scene_playback_active:
             interrupt_for_lookaway()
@@ -3436,6 +3622,7 @@ def main():
             or greeting_active
             or scene_busy
             or (worker_thread is not None and worker_thread.is_alive())
+            or face_scan_active
         )
         dreams.update(dt, idle_time, allow_idle=not busy)
 
