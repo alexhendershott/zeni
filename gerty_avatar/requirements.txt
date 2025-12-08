@@ -5,3 +5,4 @@ soundfile>=0.12.1
 numpy>=1.26.0
 scipy>=1.11.0
 opencv-python>=4.9.0
+mediapipe>=0.10.14

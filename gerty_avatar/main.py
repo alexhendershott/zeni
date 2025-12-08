@@ -24,6 +24,14 @@ except ImportError:  # pragma: no cover - OpenCV optional
     print("OpenCV not available; eye contact disabled.")
 
 try:
+    import mediapipe as mp
+    mp_face_mesh = mp.solutions.face_mesh
+except ImportError:  # pragma: no cover - MediaPipe optional
+    mp = None
+    mp_face_mesh = None
+    print("MediaPipe not available; landmark vision disabled.")
+
+try:
     from scipy import signal as scipy_signal
 except ImportError:  # pragma: no cover - SciPy is optional
     scipy_signal = None
@@ -1565,7 +1573,7 @@ class GazeTracker:
         frame_width=320,
         frame_height=240,
         stare_threshold=5.0,
-        lookaway_grace=0.45,
+        lookaway_grace=None,
     ):
         self.enabled = cv2 is not None and os.getenv("DISABLE_VISION", "0") != "1"
         default_cam = os.getenv("VISION_CAMERA_INDEX", "0")
@@ -1578,7 +1586,12 @@ class GazeTracker:
         self.frame_height = frame_height
         self.frame_interval = 0.08
         self.stare_threshold = stare_threshold
-        self.lookaway_grace = lookaway_grace
+        if lookaway_grace is None:
+            try:
+                lookaway_grace = float(os.getenv("LOOKAWAY_GRACE", "0.05"))
+            except Exception:
+                lookaway_grace = 0.05
+        self.lookaway_grace = max(0.0, float(lookaway_grace))
 
         self._cap = None
         self._thread = None
@@ -1848,6 +1861,404 @@ class GazeTracker:
             self.squint_timer = 0.0
             if self.blink_start is None:
                 self.blink_start = now
+
+
+class LandmarkGazeTracker:
+    """
+    MediaPipe-based tracker that derives eye contact, gaze, blink, mouth activity,
+    nod/shake, and engagement score from landmarks. Falls back gracefully if
+    MediaPipe or OpenCV are unavailable.
+    """
+
+    LEFT_EYE = (33, 160, 158, 133, 153, 144)
+    RIGHT_EYE = (263, 387, 385, 362, 380, 373)
+    MOUTH = (13, 14, 78, 308)  # top, bottom, left, right
+    NOSE = 1
+    LEFT_IRIS = (468, 469, 470, 471, 472)
+    RIGHT_IRIS = (473, 474, 475, 476, 477)
+
+    def __init__(
+        self,
+        camera_index=None,
+        frame_width=640,
+        frame_height=480,
+        stare_threshold=5.0,
+        lookaway_grace=None,
+    ):
+        self.enabled = (
+            cv2 is not None
+            and mp_face_mesh is not None
+            and os.getenv("DISABLE_VISION", "0") != "1"
+        )
+        default_cam = os.getenv("VISION_CAMERA_INDEX", "0")
+        try:
+            default_cam_idx = int(default_cam)
+        except ValueError:
+            default_cam_idx = 0
+        self.camera_index = camera_index if camera_index is not None else default_cam_idx
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.frame_interval = 0.08
+        self.stare_threshold = stare_threshold
+        if lookaway_grace is None:
+            try:
+                lookaway_grace = float(os.getenv("LOOKAWAY_GRACE", "0.05"))
+            except Exception:
+                lookaway_grace = 0.05
+        self.lookaway_grace = max(0.0, float(lookaway_grace))
+
+        self.contact_yaw_limit = 0.8
+        self.contact_pitch_limit = 0.6
+        self.blink_threshold = 0.23
+        self.squint_threshold = 0.18
+        self.blink_min_duration = 0.12
+        self.slow_blink_duration = 0.35
+        self.mouth_active_threshold = 0.52
+        self.mouth_release_threshold = 0.42
+        self.nod_threshold = 0.32
+        self.shake_threshold = 0.32
+        self.gaze_offset_limit = 1.1
+
+        self._cap = None
+        self._mesh = None
+        self._thread = None
+        self._running = False
+        self._events = deque(maxlen=48)
+        self._lock = threading.Lock()
+        self._debug_stats = defaultdict(int)
+
+        self.eye_contact = False
+        self.contact_start = None
+        self.contact_loss_time = None
+        self.stare_fired = False
+        self.last_seen = 0.0
+        self.contact_ema = 0.0
+        self.engagement_ema = 0.0
+
+        self.blink_start = None
+        self.squint_timer = 0.0
+        self.last_blink_time = 0.0
+        self.last_slow_blink = 0.0
+
+        self.mouth_active = False
+        self.mouth_change_time = 0.0
+
+        self.pitch_history = deque(maxlen=120)
+        self.yaw_history = deque(maxlen=120)
+        self.last_nod_event = 0.0
+        self.last_shake_event = 0.0
+
+        if self.enabled:
+            self._setup_camera()
+
+    def _setup_camera(self):
+        try:
+            self._cap = cv2.VideoCapture(self.camera_index)
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+            try:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            self._mesh = mp_face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            if not self._cap.isOpened():
+                raise RuntimeError("camera unavailable")
+            print(f"Landmark vision ready on camera {self.camera_index}")
+        except Exception as exc:
+            print("Landmark vision unavailable:", exc)
+            self.enabled = False
+            if self._cap:
+                self._cap.release()
+                self._cap = None
+            self._mesh = None
+
+    def start(self):
+        if not self.enabled or self._running or not self._cap or self._mesh is None:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=0.6)
+            self._thread = None
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+
+    def poll(self):
+        if not self.enabled:
+            return [], {"eye_contact": False, "last_seen": self.last_seen, "engagement": 0.0}
+        with self._lock:
+            events = list(self._events)
+            self._events.clear()
+            state = {
+                "eye_contact": self.eye_contact,
+                "last_seen": self.last_seen,
+                "engagement": self.engagement_ema,
+            }
+        return events, state
+
+    def debug_snapshot(self):
+        with self._lock:
+            return {
+                "events": dict(self._debug_stats),
+                "last_seen": self.last_seen,
+                "eye_contact": self.eye_contact,
+                "engagement": self.engagement_ema,
+            }
+
+    def _push_event(self, event):
+        event["ts"] = time.time()
+        with self._lock:
+            self._events.append(event)
+            etype = event.get("type")
+            if etype:
+                self._debug_stats[etype] += 1
+
+    def _loop(self):
+        while self._running:
+            ok, frame = self._cap.read()
+            now = time.time()
+            if not ok:
+                time.sleep(self.frame_interval)
+                continue
+
+            self.frame_height, self.frame_width = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = self._mesh.process(rgb)
+            if not result.multi_face_landmarks:
+                self._handle_no_face(now)
+                time.sleep(self.frame_interval)
+                continue
+
+            landmarks = result.multi_face_landmarks[0].landmark
+            pts = self._landmarks_to_np(landmarks, self.frame_width, self.frame_height)
+            bbox = self._bbox_from_points(pts)
+            yaw, pitch = self._pose_from_landmarks(pts, bbox)
+            pose_conf = self._contact_confidence(yaw, pitch)
+            gaze_focus = self._gaze_focus(pts)
+            fallback_center_conf = 0.0
+            face_size = 0.0
+            if bbox:
+                _, _, w, h = bbox
+                face_size = (w * h) / float(max(1.0, self.frame_width * self.frame_height))
+                cx = bbox[0] + w * 0.5
+                cy = bbox[1] + h * 0.5
+                norm_dx = abs(cx - self.frame_width * 0.5) / max(1.0, self.frame_width * 0.5)
+                norm_dy = abs(cy - self.frame_height * 0.5) / max(1.0, self.frame_height * 0.5)
+                center_score = 1.0 - max(norm_dx, norm_dy)
+                fallback_center_conf = max(0.0, min(1.0, center_score)) * (0.5 + 0.5 * min(1.0, face_size / 0.08))
+
+            contact_conf = 0.4 * pose_conf + 0.4 * gaze_focus + 0.2 * fallback_center_conf
+            self.contact_ema = 0.5 * self.contact_ema + 0.5 * contact_conf
+            in_contact = contact_conf > 0.3 and self.contact_ema > 0.35
+            self._update_contact(in_contact, now)
+
+            ear = self._average_ear(pts)
+            self._update_blinks(ear, now)
+
+            mar = self._mouth_aspect_ratio(pts)
+            self._update_mouth(mar, now)
+
+            self._update_head_motion(yaw, pitch, now)
+
+            face_size = 0.0
+            if bbox:
+                _, _, w, h = bbox
+                face_size = (w * h) / float(max(1.0, self.frame_width * self.frame_height))
+            engagement_raw = (
+                0.5 * self.contact_ema
+                + 0.3 * max(0.0, 1.0 - (abs(yaw) + abs(pitch)) * 0.5)
+                + 0.2 * min(1.0, face_size / 0.12)
+            )
+            self.engagement_ema = 0.9 * self.engagement_ema + 0.1 * engagement_raw
+            self.last_seen = now
+
+            time.sleep(self.frame_interval)
+
+    def _landmarks_to_np(self, landmarks, width, height):
+        pts = []
+        for lm in landmarks:
+            pts.append([lm.x * width, lm.y * height, lm.z])
+        return np.asarray(pts, dtype=np.float32)
+
+    def _bbox_from_points(self, pts):
+        if pts.size == 0:
+            return None
+        xs = pts[:, 0]
+        ys = pts[:, 1]
+        x1, y1, x2, y2 = np.min(xs), np.min(ys), np.max(xs), np.max(ys)
+        return x1, y1, x2 - x1, y2 - y1
+
+    def _pose_from_landmarks(self, pts, bbox):
+        if pts.size == 0 or not bbox:
+            return 0.0, 0.0
+        nose = pts[self.NOSE]
+        x, y, w, h = bbox
+        cx = x + w * 0.5
+        cy = y + h * 0.5
+        yaw = (nose[0] - cx) / max(1.0, w * 0.5)
+        pitch = (nose[1] - cy) / max(1.0, h * 0.5)
+        return float(yaw), float(pitch)
+
+    def _contact_confidence(self, yaw, pitch):
+        yaw_norm = abs(yaw) / max(1e-4, self.contact_yaw_limit)
+        pitch_norm = abs(pitch) / max(1e-4, self.contact_pitch_limit)
+        score = 1.0 - 0.35 * (min(1.5, yaw_norm) + min(1.5, pitch_norm))
+        return max(0.0, min(1.0, score))
+
+    def _gaze_focus(self, pts):
+        try:
+            def _eye_focus(corner_a, corner_b, iris_idxs):
+                eye_a = pts[corner_a]
+                eye_b = pts[corner_b]
+                iris = pts[list(iris_idxs)]
+                eye_center = (eye_a[:2] + eye_b[:2]) * 0.5
+                iris_center = np.mean(iris[:, :2], axis=0)
+                eye_w = max(4.0, abs(eye_b[0] - eye_a[0]))
+                eye_h = max(2.0, abs(eye_b[1] - eye_a[1]))
+                dx = (iris_center[0] - eye_center[0]) / (eye_w * 0.5)
+                dy = (iris_center[1] - eye_center[1]) / (eye_h * 0.5)
+                offset = math.sqrt(dx * dx + dy * dy)
+                return offset
+
+            left_offset = _eye_focus(33, 133, self.LEFT_IRIS)
+            right_offset = _eye_focus(263, 362, self.RIGHT_IRIS)
+            gaze_offset = (left_offset + right_offset) * 0.5
+            focus = 1.0 - (min(1.5, gaze_offset) / max(1e-4, self.gaze_offset_limit))
+            return max(0.0, min(1.0, focus))
+        except Exception:
+            return 1.0
+
+    def _eye_aspect_ratio(self, pts, idxs):
+        p1, p2, p3, p4, p5, p6 = (pts[i] for i in idxs)
+        v1 = np.linalg.norm(p2[:2] - p6[:2])
+        v2 = np.linalg.norm(p3[:2] - p5[:2])
+        h = np.linalg.norm(p1[:2] - p4[:2]) + 1e-6
+        return (v1 + v2) / (2.0 * h)
+
+    def _average_ear(self, pts):
+        try:
+            left = self._eye_aspect_ratio(pts, self.LEFT_EYE)
+            right = self._eye_aspect_ratio(pts, self.RIGHT_EYE)
+            return (left + right) * 0.5
+        except Exception:
+            return 0.0
+
+    def _mouth_aspect_ratio(self, pts):
+        try:
+            top, bottom, left, right = (pts[i] for i in self.MOUTH)
+            vert = np.linalg.norm(top[:2] - bottom[:2])
+            horiz = np.linalg.norm(left[:2] - right[:2]) + 1e-6
+            return vert / horiz
+        except Exception:
+            return 0.0
+
+    def _handle_no_face(self, now):
+        if self.eye_contact:
+            if self.contact_loss_time is None:
+                self.contact_loss_time = now
+            elif now - self.contact_loss_time >= self.lookaway_grace:
+                self._push_event({"type": "look_away"})
+                self.eye_contact = False
+                self.contact_start = None
+                self.stare_fired = False
+                self.contact_loss_time = None
+
+    def _update_contact(self, in_contact, now):
+        if in_contact:
+            self.contact_loss_time = None
+            if not self.eye_contact:
+                self._push_event({"type": "eye_contact"})
+                self.contact_start = now
+                self.stare_fired = False
+            self.eye_contact = True
+            if self.contact_start:
+                duration = now - self.contact_start
+                if duration >= self.stare_threshold and not self.stare_fired:
+                    self._push_event({"type": "stare", "duration": duration})
+                    self.stare_fired = True
+        else:
+            if self.eye_contact:
+                if self.contact_loss_time is None:
+                    self.contact_loss_time = now
+                elif now - self.contact_loss_time >= self.lookaway_grace:
+                    self._push_event({"type": "look_away"})
+                    self.eye_contact = False
+                    self.contact_start = None
+                    self.stare_fired = False
+                    self.contact_loss_time = None
+
+    def _update_blinks(self, ear, now):
+        if ear <= 0:
+            return
+        if ear < self.blink_threshold:
+            if self.blink_start is None:
+                self.blink_start = now
+        else:
+            if self.blink_start is not None:
+                duration = now - self.blink_start
+                if duration >= self.blink_min_duration:
+                    etype = "slow_blink" if duration >= self.slow_blink_duration else "blink"
+                    self._push_event({"type": etype, "duration": duration})
+                self.blink_start = None
+                self.squint_timer = 0.0
+        if ear < self.squint_threshold:
+            self.squint_timer += self.frame_interval
+            if self.squint_timer >= 0.6 and (now - self.last_slow_blink) > 1.0:
+                self._push_event({"type": "squint"})
+                self.last_slow_blink = now
+        else:
+            self.squint_timer = 0.0
+
+    def _update_mouth(self, mar, now):
+        if mar <= 0:
+            return
+        if mar > self.mouth_active_threshold and not self.mouth_active:
+            self.mouth_active = True
+            self.mouth_change_time = now
+            self._push_event({"type": "mouth_activity", "active": True})
+        elif mar < self.mouth_release_threshold and self.mouth_active:
+            if now - self.mouth_change_time > 0.18:
+                self.mouth_active = False
+                self.mouth_change_time = now
+                self._push_event({"type": "mouth_activity", "active": False})
+
+    def _update_head_motion(self, yaw, pitch, now):
+        self.pitch_history.append((now, pitch))
+        self.yaw_history.append((now, yaw))
+
+        def _window_delta(history, window=0.9):
+            cutoff = now - window
+            vals = [v for t, v in history if t >= cutoff]
+            if not vals:
+                return 0.0
+            return max(vals) - min(vals)
+
+        nod_delta = _window_delta(self.pitch_history, window=0.9)
+        if (
+            nod_delta > self.nod_threshold
+            and now - self.last_nod_event > 1.5
+        ):
+            self.last_nod_event = now
+            self._push_event({"type": "nod", "delta": nod_delta})
+
+        shake_delta = _window_delta(self.yaw_history, window=0.9)
+        if (
+            shake_delta > self.shake_threshold
+            and now - self.last_shake_event > 1.5
+        ):
+            self.last_shake_event = now
+            self._push_event({"type": "shake", "delta": shake_delta})
 
 
 def _resample_audio(samples, orig_sr, target_sr):
@@ -2212,10 +2623,16 @@ def main():
         print("Passive sensing unavailable:", exc)
         passive = None
 
-    vision = GazeTracker()
-    if vision and not vision.enabled:
-        vision = None
-    elif vision:
+    vision = None
+    landmark_vision = LandmarkGazeTracker()
+    if landmark_vision and landmark_vision.enabled:
+        vision = landmark_vision
+    else:
+        fallback = GazeTracker()
+        if fallback and fallback.enabled:
+            print("Using fallback Haar-based gaze tracker.")
+            vision = fallback
+    if vision:
         vision.start()
 
     face = Face()
@@ -2242,6 +2659,8 @@ def main():
     speech_paused_by_gaze = False
     speech_pause_started = None
     talking_paused_for_gaze = False
+    lookaway_prompt_active = False
+    turn_abort = threading.Event()
 
     def mark_activity():
         nonlocal last_user_interaction
@@ -2363,7 +2782,9 @@ def main():
         nonlocal status_text
         nonlocal last_audio_path
         nonlocal lookaway_interrupt
+        nonlocal turn_abort
         try:
+            turn_abort.clear()
             lookaway_interrupt = False
             face.set_expression("thinking")
             status_text = "Preparing audio"
@@ -2387,10 +2808,18 @@ def main():
                 status_text = "Did not hear anything"
                 face.set_expression("neutral")
                 return
+            if turn_abort.is_set():
+                status_text = "Interrupted"
+                face.set_expression("neutral")
+                return
 
             status_text = "Thinking"
             face.set_expression("thinking")
             reply, emotion = ask_ai(transcript, voice_mood=voice_mood)
+            if turn_abort.is_set():
+                status_text = "Interrupted"
+                face.set_expression("neutral")
+                return
 
             last_reply_text = reply
             face.set_expression(emotion)
@@ -2400,9 +2829,20 @@ def main():
             draw_ui()
             time.sleep(0.02)
             face.set_talking(True)
+            if turn_abort.is_set():
+                face.set_talking(False)
+                face.set_expression("neutral")
+                status_text = "Interrupted"
+                return
             speak_text(reply)
 
             while pygame.mixer.music.get_busy():
+                if turn_abort.is_set():
+                    pygame.mixer.music.stop()
+                    face.set_talking(False)
+                    face.set_expression("neutral")
+                    status_text = "Interrupted"
+                    return
                 time.sleep(0.05)
 
             face.set_talking(False)
@@ -2484,6 +2924,42 @@ def main():
         status_text = DEFAULT_STATUS
         lookaway_interrupt = False
         reengage_thread = None
+
+    def interrupt_for_lookaway():
+        nonlocal lookaway_interrupt, speech_paused_by_gaze, talking_paused_for_gaze
+        nonlocal speech_pause_started, lookaway_prompt_active, status_text
+        nonlocal turn_abort
+        if lookaway_prompt_active:
+            return
+        if pygame.mixer.music.get_busy():
+            pygame.mixer.music.stop()
+        turn_abort.set()
+        face.set_talking(False)
+        speech_paused_by_gaze = False
+        talking_paused_for_gaze = False
+        speech_pause_started = None
+        lookaway_interrupt = True
+        face.preview_expression("concerned", duration=1.0)
+        status_text = "Stopped: eye contact lost"
+
+        if lookaway_prompt_active:
+            return
+        lookaway_prompt_active = True
+
+        def prompt_eyes_on_me():
+            nonlocal lookaway_prompt_active
+            try:
+                face.set_expression("concerned")
+                face.set_talking(True)
+                speak_text("Hey! Eyes on me please. I am speaking.")
+                while pygame.mixer.music.get_busy() and running:
+                    time.sleep(0.05)
+            finally:
+                face.set_talking(False)
+                face.set_expression("neutral")
+                lookaway_prompt_active = False
+
+        threading.Thread(target=prompt_eyes_on_me, daemon=True).start()
 
     play_greeting(is_initial=True)
 
@@ -2604,25 +3080,57 @@ def main():
                 elif not recorder.recording and not face.talking and not pygame.mixer.music.get_busy():
                     face.preview_expression("happy", duration=0.9)
             elif etype == "look_away":
-                if pygame.mixer.music.get_busy():
-                    pygame.mixer.music.stop()
-                    face.set_talking(False)
-                    speech_paused_by_gaze = False
-                    talking_paused_for_gaze = False
-                    speech_pause_started = None
-                    lookaway_interrupt = True
-                    face.preview_expression("concerned", duration=1.0)
-                    status_text = "Stopped: eye contact lost"
-                elif not recorder.recording:
-                    face.preview_expression("curious", duration=0.7)
+                interrupt_for_lookaway()
             elif etype == "stare":
                 face.respond_to_stare()
+            elif etype == "blink":
+                face.cue_blink(slow=False, length=evt.get("duration", 0.18))
             elif etype == "slow_blink":
                 face.cue_blink(slow=True, length=evt.get("duration", 0.4))
             elif etype == "squint":
                 face.preview_expression("confused", duration=1.0)
                 face.passive_target = [random.uniform(-10.0, 10.0), random.uniform(-2.0, 8.0)]
                 face.passive_timer = 0.6
+            elif etype == "mouth_activity":
+                active = bool(evt.get("active", False))
+                if active:
+                    if pygame.mixer.music.get_busy() and not speech_paused_by_gaze:
+                        pygame.mixer.music.pause()
+                        speech_paused_by_gaze = True
+                        talking_paused_for_gaze = face.talking
+                        face.set_talking(False)
+                        speech_pause_started = time.time()
+                        status_text = "Paused: user speaking"
+                else:
+                    if speech_paused_by_gaze and pygame.mixer.music.get_busy():
+                        pygame.mixer.music.unpause()
+                        if talking_paused_for_gaze:
+                            face.set_talking(True)
+                            talking_paused_for_gaze = False
+                        speech_paused_by_gaze = False
+                        speech_pause_started = None
+                        status_text = "Resuming..."
+            elif etype == "nod":
+                face.preview_expression("happy", duration=0.8)
+                face.passive_target = [random.uniform(-4.0, 4.0), random.uniform(4.0, 10.0)]
+                face.passive_timer = 0.6
+            elif etype == "shake":
+                face.preview_expression("concerned", duration=0.8)
+                face.passive_target = [random.choice([-12.0, 12.0]), random.uniform(-4.0, 6.0)]
+                face.passive_timer = 0.6
+
+        if vision and pygame.mixer.music.get_busy() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active:
+            interrupt_for_lookaway()
+
+        if not passive and gaze_state:
+            engagement = gaze_state.get("engagement")
+            if engagement is not None:
+                if engagement > 0.7:
+                    face.set_proximity_zone("near")
+                elif engagement > 0.4:
+                    face.set_proximity_zone("mid")
+                else:
+                    face.set_proximity_zone("far")
 
         if speech_paused_by_gaze and speech_pause_started:
             if not pygame.mixer.music.get_busy():
