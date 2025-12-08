@@ -8,6 +8,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 import shutil
+from collections import deque
 
 import numpy as np
 import sounddevice as sd
@@ -272,6 +273,11 @@ class Face:
         self.shadow_drift_timer = random.uniform(1.8, 3.6)
         self.shadow_merge_timer = random.uniform(4.5, 7.5)
         self.shadow_strength = 0.4
+        self.passive_offset = [0.0, 0.0]
+        self.passive_target = [0.0, 0.0]
+        self.passive_timer = 0.0
+        self.sweep = None
+        self.proximity_zone = "far"
 
     def set_expression(self, expr):
         if expr not in EMOTION_SET:
@@ -303,12 +309,68 @@ class Face:
         elif mood == "curious":
             self.preview_expression("curious", duration=1.5)
 
+    def set_proximity_zone(self, zone):
+        if zone not in {"far", "mid", "near"}:
+            return
+        if zone == self.proximity_zone:
+            return
+        self.proximity_zone = zone
+        zone_expression = {
+            "far": "neutral",
+            "mid": "curious",
+            "near": "excited",
+        }.get(zone, "neutral")
+        self.idle_expression = zone_expression
+        self._set_shadow_target(zone_expression)
+        if not self.talking and not self.manual_expression:
+            self.expression = zone_expression
+        zone_bias = {"far": -0.05, "mid": 0.02, "near": 0.08}
+        self.shadow_strength = max(0.25, min(0.85, self.shadow_strength + zone_bias.get(zone, 0.0)))
+
+    def react_to_passive(self, event):
+        if event.get("type") != "spike":
+            return
+        side = event.get("side", "left")
+        direction = -1 if side == "left" else 1
+        intensity = event.get("intensity", "soft")
+        speed = event.get("speed", "slow")
+        zone = event.get("zone", self.proximity_zone)
+        magnitude = {"soft": 8.0, "bump": 14.0, "hit": 20.0}.get(intensity, 10.0)
+        if zone == "near":
+            magnitude += 4.0
+        x_shift = direction * magnitude
+        y_shift = -8.0 if speed == "fast" else 4.0
+        self.passive_target = [x_shift, y_shift]
+        self.passive_timer = 0.9 if speed == "fast" else 0.6
+        self.shadow_target_offset[0] += x_shift * 0.15
+        self.shadow_target_offset[1] += y_shift * 0.12
+        if event.get("arc"):
+            sweep_mag = magnitude * 1.6
+            sweep_dir = "right" if side == "left" else "left"
+            self._start_sweep(sweep_dir, sweep_mag)
+        if not self.talking:
+            if zone == "near":
+                self.preview_expression("excited", duration=0.45)
+            elif speed == "fast":
+                self.preview_expression("surprised", duration=0.35)
+            elif intensity != "soft":
+                self.preview_expression("curious", duration=0.5)
+
     def _set_shadow_target(self, expr):
         if expr not in EMOTION_SET:
             return
         if expr != self.shadow_target_expression:
             self.shadow_target_expression = expr
             self.shadow_shift_timer = random.uniform(0.18, 0.42)
+
+    def _start_sweep(self, direction, magnitude):
+        offset = magnitude if direction == "right" else -magnitude
+        self.sweep = {
+            "timer": 0.0,
+            "duration": 0.55,
+            "from": list(self.passive_offset),
+            "to": [offset, self.passive_target[1] * 0.6],
+        }
 
     def _pick_talk_mood(self):
         # pick a mood for this whole talking turn
@@ -443,6 +505,7 @@ class Face:
 
         self._update_shadow_face(dt)
         self._update_head_motion(dt)
+        self._update_passive_motion(dt)
 
     def _advance_talking_expression(self, dt):
         if not self.talking_sequence:
@@ -505,6 +568,31 @@ class Face:
             target_strength += 0.08
         self.shadow_strength += (target_strength - self.shadow_strength) * min(1.0, dt * 2.4)
         self.shadow_strength = max(0.25, min(0.85, self.shadow_strength))
+
+    def _update_passive_motion(self, dt):
+        if self.sweep:
+            self.sweep["timer"] += dt
+            t = min(1.0, self.sweep["timer"] / self.sweep["duration"])
+            ease = 0.5 - 0.5 * math.cos(math.pi * t)
+            for i in (0, 1):
+                self.passive_target[i] = (
+                    self.sweep["from"][i]
+                    + (self.sweep["to"][i] - self.sweep["from"][i]) * ease
+                )
+            if t >= 1.0:
+                self.sweep = None
+                self.passive_timer = max(self.passive_timer, 0.45)
+
+        self.passive_timer = max(0.0, self.passive_timer - dt)
+        target = self.passive_target if (self.passive_timer > 0.0 or self.sweep) else [0.0, 0.0]
+        for i in (0, 1):
+            delta = target[i] - self.passive_offset[i]
+            self.passive_offset[i] += delta * min(1.0, dt * 6.5)
+        if self.passive_timer <= 0 and not self.sweep:
+            for i in (0, 1):
+                self.passive_offset[i] *= max(0.0, 1.0 - dt * 2.0)
+                if abs(self.passive_offset[i]) < 0.2:
+                    self.passive_offset[i] = 0.0
 
     def _update_head_motion(self, dt):
         jitter = 5 if self.talking else 2
@@ -582,8 +670,8 @@ class Face:
             self.shadow_expression, self.EXPRESSION_STYLES["neutral"]
         )
         base_center = (
-            WIDTH // 2 + int(self.head_offset[0]),
-            HEIGHT // 2 + int(self.head_offset[1]),
+            WIDTH // 2 + int(self.head_offset[0] + self.passive_offset[0]),
+            HEIGHT // 2 + int(self.head_offset[1] + self.passive_offset[1]),
         )
         center = base_center
         shadow_center = (
@@ -1012,6 +1100,150 @@ class AudioRecorder:
             return self._level
 
 
+class PassiveSense:
+    """
+    Lightweight passive listener that samples amplitude only.
+    It emits spike events and proximity zone changes without keeping raw audio.
+    """
+
+    def __init__(
+        self,
+        samplerate=16000,
+        block_duration=0.08,
+        avg_window=1.6,
+        sensitivity=1.0,
+    ):
+        self.samplerate = samplerate
+        self.block_duration = block_duration
+        self.avg_window = avg_window
+        self._lock = threading.Lock()
+        self._history = deque(maxlen=int(avg_window / block_duration) + 20)
+        self._events = deque(maxlen=32)
+        self._stream = None
+        self._paused = False
+        self._level = 0.0
+        self._last_amp = 0.0
+        self.zone = "far"
+        self._last_side = random.choice(["left", "right"])
+        self._last_spike_time = 0.0
+        self.sensitivity = max(0.2, min(5.0, float(sensitivity)))
+        self._base_spike_floor = 0.0015
+        self._base_spike_threshold = 0.0035
+        self._base_delta_threshold = 0.0025
+        self._base_zone_mid = 0.005
+        self._base_zone_near = 0.018
+        self._recompute_thresholds()
+
+    def start(self):
+        if self._stream:
+            return
+        blocksize = max(64, int(self.samplerate * self.block_duration))
+        self._stream = sd.InputStream(
+            samplerate=self.samplerate,
+            channels=1,
+            dtype="float32",
+            blocksize=blocksize,
+            callback=self._callback,
+        )
+        self._stream.start()
+
+    def stop(self):
+        if not self._stream:
+            return
+        self._stream.stop()
+        self._stream.close()
+        self._stream = None
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    def _choose_side(self, speed_tag):
+        if speed_tag == "fast":
+            if random.random() < 0.6:
+                return "right" if self._last_side == "left" else "left"
+        return "left" if random.random() < 0.55 else "right"
+
+    def _recompute_thresholds(self):
+        scale = max(0.2, min(5.0, self.sensitivity))
+        inv = 1.0 / scale
+        self.spike_floor = self._base_spike_floor * inv
+        self.spike_threshold = self._base_spike_threshold * inv
+        self.delta_threshold = self._base_delta_threshold * inv
+        self.zone_mid = self._base_zone_mid * inv
+        self.zone_near = self._base_zone_near * inv
+
+    def set_sensitivity(self, value):
+        self.sensitivity = max(0.2, min(5.0, float(value)))
+        self._recompute_thresholds()
+
+    def _callback(self, indata, frames, time_info, status):
+        if status:
+            print("Passive audio status:", status)
+        if self._paused:
+            return
+        amp = float(np.sqrt(np.mean(np.square(indata)))) if indata.size else 0.0
+        amp = min(1.0, amp)
+        now = time.time()
+        with self._lock:
+            self._history.append((now, amp))
+            self._detect_spike(now, amp)
+            self._update_zone(now)
+            self._level = 0.65 * self._level + 0.35 * amp
+            self._last_amp = amp
+
+    def _detect_spike(self, now, amp):
+        delta = amp - self._last_amp
+        if amp < self.spike_floor:
+            return
+        if amp < self.spike_threshold and delta < self.delta_threshold:
+            return
+        speed_tag = "fast" if delta > 0.025 else "slow"
+        if amp > 0.04:
+            intensity = "hit"
+        elif amp > 0.012:
+            intensity = "bump"
+        else:
+            intensity = "soft"
+        side = self._choose_side(speed_tag)
+        arc = (now - self._last_spike_time) < 1.1 and side != self._last_side
+        self._last_spike_time = now
+        self._last_side = side
+        self._events.append(
+            {
+                "type": "spike",
+                "amp": amp,
+                "side": side,
+                "speed": speed_tag,
+                "intensity": intensity,
+                "arc": arc,
+                "zone": self.zone,
+            }
+        )
+
+    def _update_zone(self, now):
+        cutoff = now - self.avg_window
+        recent = [amp for t, amp in self._history if t >= cutoff]
+        avg = sum(recent) / len(recent) if recent else 0.0
+        zone = "far"
+        if avg > self.zone_near:
+            zone = "near"
+        elif avg > self.zone_mid:
+            zone = "mid"
+        if zone != self.zone:
+            self.zone = zone
+            self._events.append({"type": "zone", "zone": zone})
+
+    def poll(self):
+        with self._lock:
+            events = list(self._events)
+            self._events.clear()
+            level = self._level
+        return events, level
+
+
 def _resample_audio(samples, orig_sr, target_sr):
     if orig_sr == target_sr:
         return samples
@@ -1282,7 +1514,21 @@ def main():
 
     configure_input_device()
 
+    try:
+        passive_default = float(os.getenv("PASSIVE_SENSE_GAIN", "1.0"))
+    except ValueError:
+        passive_default = 1.0
+
+    passive = PassiveSense(sensitivity=passive_default)
+    try:
+        passive.start()
+    except Exception as exc:
+        print("Passive sensing unavailable:", exc)
+        passive = None
+
     face = Face()
+    if passive:
+        face.set_proximity_zone(passive.zone)
     running = True
     status_text = DEFAULT_STATUS
     confirmation_sound = make_confirmation_chirp()
@@ -1487,7 +1733,6 @@ def main():
 
     while running:
         dt = clock.tick(60) / 1000.0
-        face.update(dt)
 
         events = pygame.event.get()
         for event in events:
@@ -1508,6 +1753,8 @@ def main():
                         if not recorder.recording:
                             if confirmation_sound:
                                 confirmation_sound.play()
+                            if passive:
+                                passive.pause()
                             recorder.start()
                             face.set_expression("thinking")
                             status_text = "Listening... release space"
@@ -1519,6 +1766,12 @@ def main():
                             status_text = "Playing last input sample"
                         else:
                             status_text = "No recording to play"
+                elif event.key == pygame.K_LEFTBRACKET and passive:
+                    passive.set_sensitivity(passive.sensitivity * 0.85)
+                    status_text = f"Passive sensitivity {passive.sensitivity:.2f}x"
+                elif event.key == pygame.K_RIGHTBRACKET and passive:
+                    passive.set_sensitivity(passive.sensitivity * 1.15)
+                    status_text = f"Passive sensitivity {passive.sensitivity:.2f}x"
                 elif event.key == pygame.K_d:
                     print_audio_devices()
                     status_text = "Device list printed to console"
@@ -1528,6 +1781,8 @@ def main():
                     if recorder.recording:
                         status_text = "Finishing capture"
                         audio_capture = recorder.stop()
+                        if passive:
+                            passive.resume()
                         if audio_capture is None or audio_capture.size == 0:
                             status_text = "Did not hear anything"
                             face.set_expression("neutral")
@@ -1552,7 +1807,16 @@ def main():
         ):
             play_greeting(is_initial=False)
 
-        signal_now = draw_ui(recorder.recording, recorder.level() if recorder.recording else 0.0)
+        passive_events, passive_level = (passive.poll() if passive else ([], 0.0))
+        for evt in passive_events:
+            if evt.get("type") == "zone":
+                face.set_proximity_zone(evt.get("zone"))
+            elif evt.get("type") == "spike":
+                face.react_to_passive(evt)
+
+        face.update(dt)
+        level_source = recorder.level() if recorder.recording else passive_level
+        signal_now = draw_ui(recorder.recording, level_source)
         if signal_now and signal_message_cooldown <= 0 and not greeting_active:
             status_text = "FATAL: containment.flag ≠ expected"
             signal_message_cooldown = 8.0
@@ -1567,6 +1831,8 @@ def main():
             if event.type == pygame.USEREVENT + 1:
                 face.set_talking(False)
 
+    if passive:
+        passive.stop()
     pygame.quit()
 
 if __name__ == "__main__":
