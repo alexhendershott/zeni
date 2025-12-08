@@ -222,6 +222,7 @@ class Face:
         self.expression = "neutral"
         self.idle_expression = "neutral"
         self.talking = False
+        self.input_level = 0.0
 
         self.blink_timer = 0.0
         self.blink_interval = 3.0
@@ -625,7 +626,8 @@ class Face:
     
     def _apply_ambient_noise(self, surf):
         """Subtle persistent visual artifacts to make it feel unstable"""
-        noise_intensity = 0.3 + 0.15 * math.sin(self.noise_timer * 0.8)
+        mic_factor = min(1.0, self.input_level * 12.0)
+        noise_intensity = 0.15 + 0.3 * mic_factor + 0.18 * math.sin(self.noise_timer * 0.8)
         
         num_artifacts = int(25 * noise_intensity)
         for _ in range(num_artifacts):
@@ -661,6 +663,30 @@ class Face:
                 y = random.randint(0, HEIGHT)
                 color = random.choice([(0, 0, 0), (255, 255, 255), (200, 100, 100)])
                 pygame.draw.rect(surf, color, pygame.Rect(x, y, 2, 2))
+        
+        if self.input_level > 0.02:
+            band_count = int(4 + self.input_level * 14)
+            band_height = int(self.input_level * HEIGHT * 0.95)
+            y = HEIGHT // 2 - band_height // 2
+            band_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            for i in range(band_count):
+                offset = random.random() * 0.5
+                x = int(((i + offset) / band_count) * WIDTH)
+                width = max(2, int(2 + self.input_level * 10))
+                brightness = int(120 + self.input_level * 180)
+                alpha = int(80 + self.input_level * 140)
+                color = (brightness, brightness, brightness, max(80, min(255, alpha)))
+                rect = pygame.Rect(x - width // 2, y, width, band_height)
+                pygame.draw.rect(band_surface, color, rect, border_radius=max(2, width // 2))
+                pygame.draw.line(
+                    band_surface,
+                    (min(255, brightness + 30),) * 3 + (max(120, alpha),),
+                    (x, y),
+                    (x, y + band_height),
+                    1,
+                )
+            band_surface.set_alpha(max(80, int(120 * mic_factor)))
+            surf.blit(band_surface, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
     
     def _draw_eyes(self, surf, center, style):
         eye_y = center[1] - 40 + style.get("eye_drop", 0)
@@ -1097,6 +1123,7 @@ def main():
         last_user_interaction = time.time()
 
     def draw_ui(show_meter=False, level=0.0):
+        face.input_level = level
         face.draw(screen)
 
         if show_meter:
