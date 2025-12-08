@@ -260,11 +260,23 @@ class Face:
         self.noise_timer = 0.0
         self.voice_hint = None
         self.previous_frame = None
+        self.shadow_expression = "neutral"
+        self.shadow_target_expression = "neutral"
+        self.shadow_shift_timer = 0.0
+        self.shadow_offset = [
+            random.uniform(-6.0, 6.0),
+            random.uniform(-4.0, 4.0),
+        ]
+        self.shadow_target_offset = list(self.shadow_offset)
+        self.shadow_drift_timer = random.uniform(1.8, 3.6)
+        self.shadow_merge_timer = random.uniform(4.5, 7.5)
+        self.shadow_strength = 0.4
 
     def set_expression(self, expr):
         if expr not in EMOTION_SET:
             expr = "happy"
         self.idle_expression = expr
+        self._set_shadow_target(expr)
         if not self.talking:
             self.expression = expr
 
@@ -289,6 +301,13 @@ class Face:
             self.preview_expression("surprised", duration=1.5)
         elif mood == "curious":
             self.preview_expression("curious", duration=1.5)
+
+    def _set_shadow_target(self, expr):
+        if expr not in EMOTION_SET:
+            return
+        if expr != self.shadow_target_expression:
+            self.shadow_target_expression = expr
+            self.shadow_shift_timer = random.uniform(0.18, 0.42)
 
     def _pick_talk_mood(self):
         # pick a mood for this whole talking turn
@@ -421,6 +440,7 @@ class Face:
         
         self.noise_timer += dt
 
+        self._update_shadow_face(dt)
         self._update_head_motion(dt)
 
     def _advance_talking_expression(self, dt):
@@ -441,6 +461,49 @@ class Face:
                 self.expression = self.idle_expression
             else:
                 self.expression = self.talking_sequence[self.talking_sequence_index][0]
+
+    def _update_shadow_face(self, dt):
+        tone_target = self.manual_expression or self.idle_expression
+        if tone_target:
+            self._set_shadow_target(tone_target)
+
+        if self.shadow_expression != self.shadow_target_expression:
+            self.shadow_shift_timer -= dt
+            if self.shadow_shift_timer <= 0:
+                self.shadow_expression = self.shadow_target_expression
+                self.shadow_shift_timer = random.uniform(0.5, 0.85)
+
+        self.shadow_drift_timer -= dt
+        if self.shadow_drift_timer <= 0:
+            drift_span = 24 if not self.talking else 36
+            self.shadow_target_offset = [
+                random.uniform(-drift_span, drift_span),
+                random.uniform(-drift_span * 0.6, drift_span * 0.6),
+            ]
+            self.shadow_drift_timer = random.uniform(1.6, 3.2)
+
+        self.shadow_merge_timer -= dt
+        if self.shadow_merge_timer <= 0:
+            if random.random() < 0.45:
+                self.shadow_target_offset = [0.0, 0.0]
+            else:
+                merge_span = random.uniform(28.0, 46.0)
+                self.shadow_target_offset = [
+                    random.uniform(-merge_span, merge_span),
+                    random.uniform(-merge_span * 0.6, merge_span * 0.6),
+                ]
+            self.shadow_merge_timer = random.uniform(4.5, 7.5)
+
+        for i in (0, 1):
+            delta = self.shadow_target_offset[i] - self.shadow_offset[i]
+            self.shadow_offset[i] += delta * min(1.0, dt * 1.8)
+
+        target_strength = 0.35 + 0.25 * (1.0 if self.talking else 0.0)
+        target_strength += 0.15 * min(1.0, self.input_level * 5.0)
+        if self.signal_active or self.glitch_active:
+            target_strength += 0.08
+        self.shadow_strength += (target_strength - self.shadow_strength) * min(1.0, dt * 2.4)
+        self.shadow_strength = max(0.25, min(0.85, self.shadow_strength))
 
     def _update_head_motion(self, dt):
         jitter = 5 if self.talking else 2
@@ -496,9 +559,17 @@ class Face:
         if self.glitch_active:
             self._apply_glitch_effects(surf)
         style = self.EXPRESSION_STYLES.get(self.expression, self.EXPRESSION_STYLES["neutral"])
-        center = (
+        shadow_style = self.EXPRESSION_STYLES.get(
+            self.shadow_expression, self.EXPRESSION_STYLES["neutral"]
+        )
+        base_center = (
             WIDTH // 2 + int(self.head_offset[0]),
             HEIGHT // 2 + int(self.head_offset[1]),
+        )
+        center = base_center
+        shadow_center = (
+            base_center[0] + int(self.shadow_offset[0]),
+            base_center[1] + int(self.shadow_offset[1]),
         )
         radius = 140
 
@@ -506,6 +577,8 @@ class Face:
         pulse_speed = 3.2 if self.talking else 1.6
         pulse = base + int(22 * (0.5 + 0.5 * math.sin(self.talk_timer * pulse_speed + self.talk_phase)))
         pulse = max(20, min(90, pulse))
+
+        self._draw_shadow_face(surf, shadow_center, shadow_style, radius)
 
         if self.signal_active:
             distort = random.randint(-6, 6)
@@ -533,6 +606,44 @@ class Face:
         
         self._apply_ambient_noise(surf)
         self.previous_frame = surf.copy()
+
+    def _draw_shadow_face(self, surf, center, style, base_radius):
+        layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        jitter = math.sin(self.noise_timer * 0.9 + self.talk_phase * 0.5)
+        radius = int(base_radius * (0.9 + 0.05 * jitter))
+        glow_base = int(60 + 90 * self.shadow_strength)
+        glow_color = (glow_base, glow_base + 25, glow_base + 70, 140)
+        core_color = (
+            min(255, glow_base + 30),
+            min(255, glow_base + 55),
+            min(255, glow_base + 120),
+            180,
+        )
+
+        pygame.draw.circle(layer, glow_color, center, radius + 12)
+        pygame.draw.circle(layer, core_color, center, radius)
+
+        echo_color = (190, 210, 255)
+        tone_wobble = 0.12 + 0.25 * self.shadow_strength
+        talk_amount = tone_wobble + 0.08 * math.sin(self.noise_timer * 1.4 + self.talk_phase * 0.3)
+        talk_amount = max(0.05, talk_amount)
+        self._draw_eyes(layer, center, style, color=echo_color)
+        self._draw_mouth(layer, center, style, talk_override=talk_amount, color=echo_color)
+
+        separation = abs(self.shadow_offset[0]) + abs(self.shadow_offset[1])
+        if separation > 32:
+            ghost = layer.copy()
+            ghost.set_alpha(int(40 + min(80, separation)))
+            surf.blit(
+                ghost,
+                (
+                    int(center[0] - self.shadow_offset[0] * 0.4),
+                    int(center[1] - self.shadow_offset[1] * 0.4),
+                ),
+            )
+
+        layer.set_alpha(int(80 + 120 * self.shadow_strength))
+        surf.blit(layer, (0, 0))
 
     def _apply_glitch_effects(self, surf):
         """Apply pre-render glitch effects to the background"""
@@ -688,7 +799,7 @@ class Face:
             band_surface.set_alpha(max(80, int(120 * mic_factor)))
             surf.blit(band_surface, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
     
-    def _draw_eyes(self, surf, center, style):
+    def _draw_eyes(self, surf, center, style, color=(220, 220, 240)):
         eye_y = center[1] - 40 + style.get("eye_drop", 0)
         eye_offset_x = 45
         base = 18 * style.get("eye_scale", 1.0)
@@ -699,13 +810,12 @@ class Face:
                 x = center[0] + sign * eye_offset_x
                 pygame.draw.rect(
                     surf,
-                    (220, 220, 240),
+                    color,
                     pygame.Rect(x - base, eye_y - 2, base * 2, h),
                 )
             return
 
         if self.expression == "thinking":
-            color = (220, 220, 240)
             brow_y = eye_y - int(base * 2.2)
             brow_len = int(base * 2.0)
             tilt = int(base * 0.4)
@@ -733,7 +843,7 @@ class Face:
             w = int(base * 0.9)
             h = int(base * 1.45)
             rect = pygame.Rect(x - w, eye_y - h, w * 2, h * 2)
-            pygame.draw.ellipse(surf, (220, 220, 240), rect)
+            pygame.draw.ellipse(surf, color, rect)
 
     def _talk_amount(self):
         if self.talking:
@@ -742,16 +852,15 @@ class Face:
             return max(0.08, base + wobble)
         return 0.08 + 0.03 * math.sin(self.talk_timer * 1.6 + self.talk_phase)
 
-    def _draw_mouth(self, surf, center, style):
+    def _draw_mouth(self, surf, center, style, talk_override=None, color=(220, 220, 240)):
         m = style.get("mouth", "flat")
         width = style.get("mouth_width", 90)
         if self.talking:
             width *= 1.0 + 0.08 * math.sin(self.talk_timer * 5.3 + self.talk_phase)
         width = int(width)
         y = center[1] + 40
-        talk = self._talk_amount()
+        talk = self._talk_amount() if talk_override is None else talk_override
         height = 35 + talk * 30
-        color = (220, 220, 240)
 
         if m == "smile":
             rect = pygame.Rect(center[0] - width, y - height, width * 2, height * 2)
