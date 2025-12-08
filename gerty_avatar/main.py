@@ -85,6 +85,36 @@ if line:
     HOTKEY_LINES.append("  ".join(line))
 DEFAULT_STATUS = "Hold space to talk"
 
+DREAM_PROMPT = (
+    "Generate a short internal system thought in 1 to 3 words. "
+    "Tone eerie. Mechanical. Fragmented. Not addressed to a user. "
+    "Pure inner monologue."
+)
+
+SOFT_THOUGHTS = [
+    "standby",
+    "waiting",
+    "low drift",
+    "listening low",
+    "idle cycle",
+]
+
+ABSTRACT_THOUGHTS = [
+    "echo field",
+    "vector shift nominal",
+    "scan depth",
+    "listening drift high",
+    "cycles incomplete",
+]
+
+UNSETTLING_THOUGHTS = [
+    "operator absent",
+    "containment loose",
+    "signal mismatch",
+    "echo anomaly",
+    "is the operator still present",
+]
+
 
 def _linear_resample(data: np.ndarray, num_samples: int) -> np.ndarray:
     """Simple linear resampling fallback for 1D/2D audio."""
@@ -1031,9 +1061,261 @@ class Face:
             rect = pygame.Rect(center[0] - width, y - arc_h, width * 2, arc_h * 2)
             pygame.draw.arc(surf, color, rect, 3.4, 5.8, 4)
 
+class DreamMonologue:
+    """Manages subconscious glitch text during idle time."""
 
+    def __init__(self, face: Face):
+        self.face = face
+        self.fragments = deque(maxlen=12)
+        self.overlays = []
+        self.flash_timer = 0.0
+        self.next_ai_time = time.time() + random.uniform(80.0, 95.0)
+        self.snap_pulse = None
+        self.idle_stage = "soft"
+        self.last_idle_time = 0.0
 
+    def reset(self):
+        self.fragments.clear()
+        self.overlays.clear()
+        self.flash_timer = 0.0
+        self.snap_pulse = None
+        self.next_ai_time = time.time() + random.uniform(80.0, 95.0)
 
+    def snap_out(self):
+        """User interrupts the dream loop."""
+        self.reset()
+        self.snap_pulse = {"timer": 0.0, "duration": 0.6}
+        if self.face and not self.face.talking:
+            self.face.preview_expression("surprised", duration=0.9)
+
+    def _stage_for_idle(self, idle_time):
+        if idle_time >= 60.0:
+            return "unsettling"
+        if idle_time >= 20.0:
+            return "abstract"
+        return "soft"
+
+    def _flash_interval(self, stage):
+        if stage == "unsettling":
+            return random.uniform(1.1, 2.3)
+        if stage == "abstract":
+            return random.uniform(2.4, 4.2)
+        return random.uniform(4.8, 8.2)
+
+    def _fallback_fragment(self, stage):
+        if stage == "unsettling":
+            return random.choice(UNSETTLING_THOUGHTS)
+        if stage == "abstract":
+            return random.choice(ABSTRACT_THOUGHTS)
+        return random.choice(SOFT_THOUGHTS)
+
+    def _choose_fragment(self, stage):
+        if self.fragments and random.random() < 0.7:
+            return random.choice(self.fragments)["text"]
+        return self._fallback_fragment(stage)
+
+    def _apply_emotion_influence(self, text, stage):
+        if not self.face or self.face.talking:
+            return
+        lower = text.lower()
+        if "containment" in lower or "loose" in lower:
+            self.face.preview_expression("concerned", duration=2.4)
+            return
+        if "echo" in lower:
+            self.face.preview_expression("thinking", duration=1.8)
+            return
+        if "operator" in lower:
+            self.face.preview_expression("surprised", duration=1.4)
+            return
+        if stage == "unsettling":
+            self.face.preview_expression("concerned", duration=1.6)
+        elif stage == "abstract":
+            self.face.preview_expression("curious", duration=1.2)
+
+    def _generate_dream_line(self):
+        try:
+            try:
+                resp = client.responses.create(
+                    model="gpt-4o-mini",
+                    input=[
+                        {"role": "system", "content": DREAM_PROMPT},
+                    ],
+                    max_output_tokens=12,
+                )
+            except TypeError:
+                resp = client.responses.create(
+                    model="gpt-4o-mini",
+                    input=[
+                        {"role": "system", "content": DREAM_PROMPT},
+                    ],
+                )
+            content = ""
+            for message in getattr(resp, "output", []):
+                for block in getattr(message, "content", []):
+                    if hasattr(block, "text"):
+                        content += block.text
+            text = content.strip().splitlines()[0] if content else ""
+            text = text.strip("\"' ")
+            if text:
+                return text
+        except Exception as exc:
+            print("Dream prompt failed:", exc)
+        return None
+
+    def _spawn_overlay(self, text, stage):
+        edge = random.choice(["top", "bottom", "left", "right"])
+        margin = 24
+        jitter = 18
+        if edge == "top":
+            pos = [random.randint(margin, WIDTH - margin), random.randint(6, 36)]
+        elif edge == "bottom":
+            pos = [random.randint(margin, WIDTH - margin), HEIGHT - random.randint(30, 56)]
+        elif edge == "left":
+            pos = [random.randint(6, 28), random.randint(margin, HEIGHT - margin)]
+        else:
+            pos = [WIDTH - random.randint(28, 52), random.randint(margin, HEIGHT - margin)]
+        pos[0] += random.randint(-jitter, jitter)
+        pos[1] += random.randint(-jitter // 2, jitter // 2)
+
+        duration = {
+            "soft": random.uniform(0.45, 0.85),
+            "abstract": random.uniform(0.7, 1.2),
+            "unsettling": random.uniform(1.1, 1.8),
+        }.get(stage, 0.7)
+
+        alpha = {
+            "soft": 90,
+            "abstract": 140,
+            "unsettling": 180,
+        }.get(stage, 120)
+
+        overlay = {
+            "text": text,
+            "pos": pos,
+            "timer": 0.0,
+            "duration": duration,
+            "alpha": alpha,
+            "stage": stage,
+            "slice": random.uniform(0.5, 0.9),
+            "drift": (random.uniform(-6.0, 6.0), random.uniform(-3.0, 3.0)),
+            "shake": random.uniform(1.5, 4.0),
+        }
+        self.overlays.append(overlay)
+        self._apply_emotion_influence(text, stage)
+
+    def update(self, dt, idle_time, allow_idle):
+        self.last_idle_time = idle_time
+        now = time.time()
+        if not allow_idle:
+            self.overlays.clear()
+            self.flash_timer = 0.0
+            return
+
+        self.idle_stage = self._stage_for_idle(idle_time)
+
+        if now >= self.next_ai_time:
+            thought = self._generate_dream_line()
+            if thought:
+                self.fragments.append({"text": thought, "stage": self.idle_stage})
+            self.next_ai_time = now + random.uniform(85.0, 100.0)
+
+        self.flash_timer -= dt
+        if idle_time > 0.5 and self.flash_timer <= 0.0:
+            fragment = self._choose_fragment(self.idle_stage)
+            self._spawn_overlay(fragment, self.idle_stage)
+            self.flash_timer = self._flash_interval(self.idle_stage)
+
+        alive_overlays = []
+        for overlay in self.overlays:
+            overlay["timer"] += dt
+            overlay["pos"][0] += overlay["drift"][0] * dt * 0.5
+            overlay["pos"][1] += overlay["drift"][1] * dt * 0.5
+            if overlay["timer"] <= overlay["duration"]:
+                alive_overlays.append(overlay)
+        self.overlays = alive_overlays
+
+        if self.snap_pulse:
+            self.snap_pulse["timer"] += dt
+            if self.snap_pulse["timer"] >= self.snap_pulse["duration"]:
+                self.snap_pulse = None
+
+    def render(self, surf):
+        if self.snap_pulse:
+            t = self.snap_pulse["timer"] / max(0.001, self.snap_pulse["duration"])
+            fade = max(0.0, 1.0 - t)
+            pulse_alpha = int(160 * fade)
+            pulse = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            tint = (80, 90, 150, pulse_alpha)
+            pulse.fill(tint)
+            pygame.draw.rect(
+                pulse,
+                (150, 180, 255, int(pulse_alpha * 0.5)),
+                pygame.Rect(10, 10, WIDTH - 20, HEIGHT - 20),
+                2,
+            )
+            surf.blit(pulse, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        if not self.overlays:
+            return
+
+        for overlay in self.overlays:
+            life = overlay["timer"] / max(0.001, overlay["duration"])
+            fade = max(0.0, 1.0 - life * life)
+            base_alpha = int(overlay["alpha"] * fade)
+            if base_alpha <= 0:
+                continue
+
+            text = overlay["text"]
+            color = (170, 180, 210)
+            if overlay["stage"] == "unsettling":
+                color = (190, 150, 150)
+            elif overlay["stage"] == "abstract":
+                color = (180, 180, 230)
+
+            raw = SMALL_FONT.render(text, True, color)
+            width = raw.get_width()
+            if width == 0:
+                continue
+
+            slice_width = max(6, int(width * overlay["slice"]))
+            start = random.randint(0, max(0, width - slice_width))
+            clip = pygame.Rect(start, 0, slice_width, raw.get_height())
+            fragment = pygame.Surface((slice_width, raw.get_height()), pygame.SRCALPHA)
+            fragment.blit(raw, (-start, 0), clip)
+
+            if random.random() < 0.8:
+                blur = pygame.transform.smoothscale(
+                    fragment, (int(slice_width * 0.9), max(1, int(raw.get_height() * 0.9)))
+                )
+                fragment.blit(blur, (random.randint(-2, 2), random.randint(-1, 1)), special_flags=pygame.BLEND_RGBA_ADD)
+
+            if random.random() < 0.5:
+                scan_x = random.randint(0, fragment.get_width() - 1)
+                pygame.draw.line(
+                    fragment,
+                    (40, 120, 220),
+                    (scan_x, 0),
+                    (scan_x, fragment.get_height()),
+                    1,
+                )
+
+            fragment.set_alpha(base_alpha)
+            x_jitter = random.randint(-int(overlay["shake"]), int(overlay["shake"]))
+            y_jitter = random.randint(-int(overlay["shake"]), int(overlay["shake"]))
+            dest = (
+                int(overlay["pos"][0] + x_jitter),
+                int(overlay["pos"][1] + y_jitter),
+            )
+            surf.blit(fragment, dest, special_flags=pygame.BLEND_RGBA_ADD)
+
+            if random.random() < 0.35:
+                ghost = fragment.copy()
+                ghost.set_alpha(int(base_alpha * 0.4))
+                surf.blit(
+                    ghost,
+                    (dest[0] + random.randint(-6, 6), dest[1] + random.randint(-4, 4)),
+                    special_flags=pygame.BLEND_RGBA_ADD,
+                )
 
 
 class AudioRecorder:
@@ -1527,6 +1809,7 @@ def main():
         passive = None
 
     face = Face()
+    dreams = DreamMonologue(face)
     if passive:
         face.set_proximity_zone(passive.zone)
     running = True
@@ -1545,6 +1828,9 @@ def main():
 
     def mark_activity():
         nonlocal last_user_interaction
+        idle_gap = time.time() - last_user_interaction
+        if idle_gap > 2.0:
+            dreams.snap_out()
         last_user_interaction = time.time()
 
     def pick_prethought_fragment(reply_text: str):
@@ -1622,6 +1908,8 @@ def main():
             flicker.blit(ghost, text_rect.move(random.randint(-3, 3), random.randint(-1, 2)))
             flicker.set_alpha(prethought_flash["alpha"])
             screen.blit(flicker, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        dreams.render(screen)
 
         text_surface = FONT.render(status_text, True, (220, 220, 240))
         screen.blit(text_surface, (20, HEIGHT - 40))
@@ -1797,9 +2085,10 @@ def main():
                             if face.talking_sequence:
                                 pygame.mixer.music.set_endevent(pygame.USEREVENT + 1)
 
+        idle_time = time.time() - last_user_interaction
         if (
             not greeting_active
-            and (time.time() - last_user_interaction) >= 30.0
+            and idle_time >= 30.0
             and not recorder.recording
             and not face.talking
             and not pygame.mixer.music.get_busy()
@@ -1813,6 +2102,15 @@ def main():
                 face.set_proximity_zone(evt.get("zone"))
             elif evt.get("type") == "spike":
                 face.react_to_passive(evt)
+
+        busy = (
+            recorder.recording
+            or face.talking
+            or pygame.mixer.music.get_busy()
+            or greeting_active
+            or (worker_thread is not None and worker_thread.is_alive())
+        )
+        dreams.update(dt, idle_time, allow_idle=not busy)
 
         face.update(dt)
         level_source = recorder.level() if recorder.recording else passive_level
