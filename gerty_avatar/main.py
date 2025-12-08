@@ -3038,7 +3038,7 @@ def main():
                 return
             creepy_line = (
                 "You look a little rough today. "
-                f"{description.rstrip('.')}. I see you even when you try not to be seen."
+                f"{description.rstrip('.')}. I seeeee you."
             )
             log_scene(f"Face describe ok ({reason}): {description[:80]}")
             face.set_talking(True)
