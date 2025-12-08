@@ -258,6 +258,7 @@ class Face:
         self.scan_line_offset = 0.0
         self.noise_timer = 0.0
         self.voice_hint = None
+        self.previous_frame = None
 
     def set_expression(self, expr):
         if expr not in EMOTION_SET:
@@ -466,8 +467,18 @@ class Face:
         self.glitch_active = True
         self.glitch_duration = random.uniform(0.15, 0.6)
         self.glitch_intensity = random.uniform(0.4, 1.0)
-        glitch_types = ["static", "scanline", "chromatic", "distort", "flicker", "corrupt"]
+        glitch_types = [
+            "static",
+            "scanline",
+            "chromatic",
+            "distort",
+            "flicker",
+            "corrupt",
+            "timeslice",
+        ]
         self.glitch_type = random.choice(glitch_types)
+        if self.glitch_type == "timeslice":
+            self.glitch_duration = random.uniform(0.45, 0.6)
 
     def draw(self, surf):
         base_bg = (10, 10, 20)
@@ -520,6 +531,7 @@ class Face:
             self._apply_post_glitch_effects(surf)
         
         self._apply_ambient_noise(surf)
+        self.previous_frame = surf.copy()
 
     def _apply_glitch_effects(self, surf):
         """Apply pre-render glitch effects to the background"""
@@ -574,6 +586,25 @@ class Face:
                 dark_overlay.fill((0, 0, 0))
                 dark_overlay.set_alpha(int(180 * self.glitch_intensity))
                 surf.blit(dark_overlay, (0, 0))
+        
+        elif self.glitch_type == "timeslice":
+            if self.previous_frame is not None:
+                ghost = self.previous_frame.copy()
+                offset = int(8 + 12 * self.glitch_intensity)
+                alpha = int(150 * min(1.0, 0.5 + 0.5 * self.glitch_intensity))
+                ghost.set_alpha(alpha)
+                surf.blit(ghost, (offset, 0))
+                ghost.set_alpha(int(alpha * 0.7))
+                surf.blit(ghost, (-offset // 2, 0))
+
+                num_slices = max(4, int(8 * self.glitch_intensity))
+                for _ in range(num_slices):
+                    slice_width = random.randint(15, 50)
+                    x = random.randint(0, max(0, WIDTH - slice_width))
+                    shift = random.randint(-25, 25)
+                    dest_x = max(0, min(WIDTH - slice_width, x + shift))
+                    slice_rect = pygame.Rect(x, 0, slice_width, HEIGHT)
+                    surf.blit(self.previous_frame, (dest_x, 0), slice_rect)
         
         if self.glitch_active and random.random() < 0.4:
             num_zaps = random.randint(1, 4)
@@ -969,7 +1000,7 @@ def post_process_audio(audio_data, original_sample_rate):
     - Add light reverb
     """
     # Target sample rate (lower for different sound quality)
-    target_sample_rate = 13000
+    target_sample_rate = 16000
     
     # Pitch shift ratio (< 1.0 lowers pitch)
     pitch_ratio = 0.75  # 5% lower pitch
