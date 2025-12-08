@@ -22,7 +22,25 @@ You can even cheat by reading the amplitude curve speed.
 Fast spike means something moved close.  
 Slow curve means movement farther away.
 
-3. Zeni reacts like a creature not a chatbot  
+3. Zeni reacts to your eyes instead of your voice  
+You already use a mic.  
+Add a webcam.  
+Track eye contact only.  
+On-device tiny model.  
+If the viewer looks away mid sentence  
+Zeni stops mid sentence and waits.  
+When the viewer comes back  
+Zeni resumes softly like it noticed.  
+If the viewer stares too long  
+Zeni shifts, glances away, looks uneasy.  
+If the viewer blinks slowly  
+Zeni blinks slower in sync.  
+If the viewer squints  
+Zeni narrows eyes to match.  
+Gaze becomes the social go/no-go.  
+Humans flip out because it gives the illusion of real social awareness.  
+
+4. Zeni reacts like a creature not a chatbot  
 When passive sense fires  
 Zeni does not talk.  
 Zeni just shifts head  
@@ -31,7 +49,7 @@ moves shadow layer
 leans in or leans away.  
 Feels like it knows where you are in the room.
 
-4. Presence map  
+5. Presence map  
 Add three zones.  
 Far.  
 Mid.  
@@ -42,7 +60,7 @@ Near means Zeni gets bright and focused.
 You switch zones by looking at average ambient amplitude over two seconds.  
 This makes it look like Zeni feels your proximity.
 
-5. Motion memory  
+6. Motion memory  
 If you move from left to right quickly  
 Zeni tracks your arc.  
 Just animate a head sweep.  

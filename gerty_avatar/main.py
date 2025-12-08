@@ -8,13 +8,20 @@ import random
 from datetime import datetime
 from pathlib import Path
 import shutil
-from collections import deque
+import argparse
+from collections import deque, defaultdict
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import pygame
 from openai import OpenAI
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - OpenCV optional
+    cv2 = None
+    print("OpenCV not available; eye contact disabled.")
 
 try:
     from scipy import signal as scipy_signal
@@ -356,6 +363,22 @@ class Face:
             self.expression = zone_expression
         zone_bias = {"far": -0.05, "mid": 0.02, "near": 0.08}
         self.shadow_strength = max(0.25, min(0.85, self.shadow_strength + zone_bias.get(zone, 0.0)))
+
+    def cue_blink(self, slow=False, length=None):
+        self.blinking = True
+        self.blink_timer = 0.0
+        if length is None:
+            self.blink_length = 0.26 if slow else 0.15
+        else:
+            self.blink_length = max(0.08, float(length))
+        self.blink_interval = random.uniform(3.0, 4.5) if slow else random.uniform(2.4, 4.2)
+
+    def respond_to_stare(self):
+        offset = random.choice([-1.0, 1.0]) * random.uniform(16.0, 26.0)
+        self.passive_target = [offset, random.uniform(-4.0, 10.0)]
+        self.passive_timer = 0.9
+        if not self.talking:
+            self.preview_expression("concerned", duration=1.4)
 
     def react_to_passive(self, event):
         if event.get("type") != "spike":
@@ -1526,6 +1549,307 @@ class PassiveSense:
         return events, level
 
 
+class GazeTracker:
+    """
+    Webcam-based gaze tracker that emits coarse social cues:
+    - eye_contact: viewer is roughly centered
+    - look_away: contact broken
+    - stare: prolonged contact
+    - slow_blink: long blink detected
+    - squint: eyes narrowed for a stretch
+    """
+
+    def __init__(
+        self,
+        camera_index=None,
+        frame_width=320,
+        frame_height=240,
+        stare_threshold=5.0,
+        lookaway_grace=0.45,
+    ):
+        self.enabled = cv2 is not None and os.getenv("DISABLE_VISION", "0") != "1"
+        default_cam = os.getenv("VISION_CAMERA_INDEX", "0")
+        try:
+            default_cam_idx = int(default_cam)
+        except ValueError:
+            default_cam_idx = 0
+        self.camera_index = camera_index if camera_index is not None else default_cam_idx
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.frame_interval = 0.08
+        self.stare_threshold = stare_threshold
+        self.lookaway_grace = lookaway_grace
+
+        self._cap = None
+        self._thread = None
+        self._lock = threading.Lock()
+        self._events = deque(maxlen=24)
+        self._running = False
+        self._debug_stats = {
+            "frames": 0,
+            "faces": 0,
+            "eyes": 0,
+            "eye_contact_frames": 0,
+            "events": defaultdict(int),
+        }
+
+        self.eye_contact = False
+        self.contact_start = None
+        self.contact_loss_time = None
+        self.stare_fired = False
+        self.last_seen = 0.0
+
+        self.blink_start = None
+        self.last_squint_event = 0.0
+        self.squint_timer = 0.0
+
+        self.face_cascade = None
+        self.eye_cascade = None
+        self.eye_cascade_name = None
+
+        if self.enabled:
+            self._setup_camera()
+
+    def _load_eye_cascade(self, casc_path):
+        if not casc_path:
+            return None
+        candidates = [
+            "haarcascade_eye_tree_eyeglasses.xml",
+            "haarcascade_eye.xml",
+        ]
+        for filename in candidates:
+            full_path = os.path.join(casc_path, filename)
+            cascade = cv2.CascadeClassifier(full_path)
+            if cascade is not None and not cascade.empty():
+                self.eye_cascade_name = filename
+                return cascade
+        return None
+
+    def _setup_camera(self):
+        try:
+            self._cap = cv2.VideoCapture(self.camera_index)
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+            try:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            casc_path = getattr(cv2.data, "haarcascades", "")
+            self.face_cascade = cv2.CascadeClassifier(os.path.join(casc_path, "haarcascade_frontalface_default.xml"))
+            self.eye_cascade = self._load_eye_cascade(casc_path)
+            if (
+                not self._cap.isOpened()
+                or self.face_cascade is None
+                or self.face_cascade.empty()
+                or self.eye_cascade is None
+                or self.eye_cascade.empty()
+            ):
+                raise RuntimeError("camera or cascade unavailable")
+            print(
+                f"Vision ready on camera {self.camera_index} "
+                f"(eye cascade {self.eye_cascade_name or 'unknown'})"
+            )
+        except Exception as exc:
+            print("Vision unavailable:", exc)
+            self.enabled = False
+            if self._cap:
+                self._cap.release()
+                self._cap = None
+
+    def start(self):
+        if not self.enabled or self._running or not self._cap:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=0.6)
+            self._thread = None
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+
+    def poll(self):
+        if not self.enabled:
+            return [], {"eye_contact": False, "last_seen": self.last_seen}
+        with self._lock:
+            events = list(self._events)
+            self._events.clear()
+            state = {
+                "eye_contact": self.eye_contact,
+                "last_seen": self.last_seen,
+            }
+        return events, state
+
+    def debug_snapshot(self):
+        with self._lock:
+            return {
+                "frames": self._debug_stats["frames"],
+                "faces": self._debug_stats["faces"],
+                "eyes": self._debug_stats["eyes"],
+                "eye_contact_frames": self._debug_stats["eye_contact_frames"],
+                "events": dict(self._debug_stats["events"]),
+                "last_seen": self.last_seen,
+                "eye_contact": self.eye_contact,
+            }
+
+    def _push_event(self, event):
+        event["ts"] = time.time()
+        with self._lock:
+            self._events.append(event)
+            etype = event.get("type")
+            if etype:
+                self._debug_stats["events"][etype] += 1
+
+    def _loop(self):
+        while self._running:
+            ok, frame = self._cap.read()
+            now = time.time()
+            if not ok:
+                time.sleep(self.frame_interval)
+                continue
+
+            self.frame_height, self.frame_width = frame.shape[:2]
+            with self._lock:
+                self._debug_stats["frames"] += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            face = self._largest_face(gray)
+            if face is None:
+                self._handle_no_face(now)
+                time.sleep(self.frame_interval)
+                continue
+
+            with self._lock:
+                self._debug_stats["faces"] += 1
+                self.last_seen = now
+            x, y, w, h = face
+            in_contact = self._is_eye_contact(x, y, w, h, self.frame_width, self.frame_height)
+            self._update_contact(in_contact, now)
+
+            if in_contact:
+                with self._lock:
+                    self._debug_stats["eye_contact_frames"] += 1
+
+            eyes = self._detect_eyes(gray, face)
+            if len(eyes) > 0:
+                with self._lock:
+                    self._debug_stats["eyes"] += 1
+            self._update_blinks_and_squint(eyes, w, h, now)
+
+            time.sleep(self.frame_interval)
+
+    def _largest_face(self, gray):
+        if not self.face_cascade:
+            return None
+        normalized = cv2.equalizeHist(gray)
+        min_w = max(24, int(self.frame_width * 0.12))
+        min_h = max(24, int(self.frame_height * 0.12))
+        faces = self.face_cascade.detectMultiScale(
+            normalized,
+            scaleFactor=1.08,
+            minNeighbors=3,
+            minSize=(min_w, min_h),
+        )
+        if len(faces) == 0:
+            return None
+        faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+        return faces[0]
+
+    def _is_eye_contact(self, x, y, w, h, frame_w, frame_h):
+        cx = x + w * 0.5
+        cy = y + h * 0.5
+        norm_dx = abs(cx - frame_w * 0.5) / max(1.0, frame_w * 0.5)
+        norm_dy = abs(cy - frame_h * 0.5) / max(1.0, frame_h * 0.5)
+        size_ratio = (w * h) / float(max(1.0, frame_w * frame_h))
+        return norm_dx < 0.48 and norm_dy < 0.42 and size_ratio > 0.008
+
+    def _handle_no_face(self, now):
+        if self.eye_contact:
+            if self.contact_loss_time is None:
+                self.contact_loss_time = now
+            elif now - self.contact_loss_time >= self.lookaway_grace:
+                self._push_event({"type": "look_away"})
+                self.eye_contact = False
+                self.contact_start = None
+                self.stare_fired = False
+                self.contact_loss_time = None
+
+    def _update_contact(self, in_contact, now):
+        if in_contact:
+            self.contact_loss_time = None
+            if not self.eye_contact:
+                self._push_event({"type": "eye_contact"})
+                self.contact_start = now
+                self.stare_fired = False
+            self.eye_contact = True
+            if self.contact_start:
+                duration = now - self.contact_start
+                if duration >= self.stare_threshold and not self.stare_fired:
+                    self._push_event({"type": "stare", "duration": duration})
+                    self.stare_fired = True
+        else:
+            if self.eye_contact:
+                if self.contact_loss_time is None:
+                    self.contact_loss_time = now
+                elif now - self.contact_loss_time >= self.lookaway_grace:
+                    self._push_event({"type": "look_away"})
+                    self.eye_contact = False
+                    self.contact_start = None
+                    self.stare_fired = False
+                    self.contact_loss_time = None
+
+    def _detect_eyes(self, gray, face):
+        if not self.eye_cascade:
+            return []
+        x, y, w, h = face
+        roi_gray = gray[y : y + h, x : x + w]
+        if roi_gray.size == 0:
+            return []
+        roi_gray = cv2.equalizeHist(roi_gray)
+        min_w = max(12, int(w * 0.12))
+        min_h = max(10, int(h * 0.08))
+        eyes = self.eye_cascade.detectMultiScale(
+            roi_gray,
+            scaleFactor=1.05,
+            minNeighbors=3,
+            minSize=(min_w, min_h),
+        )
+        return eyes
+
+    def _update_blinks_and_squint(self, eyes, face_w, face_h, now):
+        eyes_visible = len(eyes) > 0
+
+        if eyes_visible:
+            if self.blink_start is not None:
+                blink_duration = now - self.blink_start
+                if blink_duration >= 0.35:
+                    self._push_event({"type": "slow_blink", "duration": blink_duration})
+                self.blink_start = None
+
+            ratios = [eh / ew for _, _, ew, eh in eyes if ew > 0]
+            if ratios:
+                avg_ratio = sum(ratios) / len(ratios)
+                if avg_ratio < 0.26:
+                    self.squint_timer += self.frame_interval
+                    if (
+                        now - self.last_squint_event > 2.0
+                        and self.squint_timer >= 0.6
+                    ):
+                        self._push_event({"type": "squint"})
+                        self.last_squint_event = now
+                else:
+                    self.squint_timer = 0.0
+            else:
+                self.squint_timer = 0.0
+        else:
+            self.squint_timer = 0.0
+            if self.blink_start is None:
+                self.blink_start = now
+
+
 def _resample_audio(samples, orig_sr, target_sr):
     if orig_sr == target_sr:
         return samples
@@ -1790,6 +2114,86 @@ def make_confirmation_chirp():
     except pygame.error:
         return None
 
+def run_vision_check(duration=8.0, verbose=False, camera_index=None):
+    """
+    Runs the gaze tracker alone for a short sampling window and prints stats.
+    Useful for confirming the camera and cascades are working without launching the full UI.
+    """
+    tracker = GazeTracker(camera_index=camera_index)
+    if not tracker.enabled:
+        print("Vision unavailable: OpenCV missing, camera busy, or cascades not found.")
+        return
+
+    duration = max(1.0, float(duration))
+    tracker.start()
+    print(f"Running vision check for {duration:.1f}s on camera index {tracker.camera_index}...")
+    event_counts = defaultdict(int)
+    try:
+        end_time = time.time() + duration
+        while time.time() < end_time:
+            events, state = tracker.poll()
+            for evt in events:
+                etype = evt.get("type")
+                if etype:
+                    event_counts[etype] += 1
+                    if verbose:
+                        print(f"Event: {etype} ({evt})")
+            if verbose and state.get("eye_contact"):
+                print("Eye contact detected")
+            time.sleep(0.12)
+    finally:
+        tracker.stop()
+
+    stats = tracker.debug_snapshot()
+    contact_ratio = (
+        stats["eye_contact_frames"] / stats["frames"] if stats["frames"] else 0.0
+    )
+    print(
+        f"Frames: {stats['frames']}, faces seen: {stats['faces']}, "
+        f"eyes detected: {stats['eyes']}, contact ratio: {contact_ratio:.2f}"
+    )
+    if stats["last_seen"]:
+        print(f"Last face seen {time.time() - stats['last_seen']:.2f}s ago")
+    else:
+        print("No face detected during the check.")
+    if event_counts:
+        print("Event counts:", dict(event_counts))
+    else:
+        print("No gaze events were fired.")
+
+
+def list_cameras(max_index=5):
+    """Probe a range of camera indices and report which open and produce frames."""
+    if cv2 is None:
+        print("OpenCV not available; cannot probe cameras.")
+        return
+    try:
+        max_index = int(max_index)
+    except Exception:
+        max_index = 5
+    max_index = max(0, max_index)
+    print(f"Probing cameras 0..{max_index} ...")
+    for idx in range(max_index + 1):
+        cap = cv2.VideoCapture(idx)
+        opened = cap.isOpened()
+        read_ok = False
+        shape = None
+        if opened:
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            except Exception:
+                pass
+            for _ in range(3):
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    read_ok = True
+                    shape = frame.shape
+                    break
+        cap.release()
+        shape_text = f"{shape}" if shape is not None else "n/a"
+        print(f"[{idx}] opened={opened} read={read_ok} shape={shape_text}")
+
 def main():
     if "OPENAI_API_KEY" not in os.environ:
         raise RuntimeError("Set OPENAI_API_KEY in your environment")
@@ -1808,12 +2212,22 @@ def main():
         print("Passive sensing unavailable:", exc)
         passive = None
 
+    vision = GazeTracker()
+    if vision and not vision.enabled:
+        vision = None
+    elif vision:
+        vision.start()
+
     face = Face()
     dreams = DreamMonologue(face)
     if passive:
         face.set_proximity_zone(passive.zone)
     running = True
     status_text = DEFAULT_STATUS
+    current_gaze_state = {"eye_contact": False, "last_seen": 0.0}
+    last_reply_text = None
+    lookaway_interrupt = False
+    reengage_thread = None
     confirmation_sound = make_confirmation_chirp()
     if confirmation_sound:
         confirmation_sound.set_volume(0.35)
@@ -1825,6 +2239,9 @@ def main():
     last_user_interaction = time.time()
     signal_message_cooldown = 0.0
     prethought_flash = None
+    speech_paused_by_gaze = False
+    speech_pause_started = None
+    talking_paused_for_gaze = False
 
     def mark_activity():
         nonlocal last_user_interaction
@@ -1914,13 +2331,40 @@ def main():
         text_surface = FONT.render(status_text, True, (220, 220, 240))
         screen.blit(text_surface, (20, HEIGHT - 40))
 
+        # Vision indicator (top-right)
+        indicator_text = "VISION OFF"
+        indicator_color = (110, 110, 110)
+        now = time.time()
+        last_seen = current_gaze_state.get("last_seen") or 0.0
+        contact = current_gaze_state.get("eye_contact", False)
+        if vision:
+            if last_seen <= 0 or now - last_seen > 2.0:
+                indicator_text = "NO FACE"
+                indicator_color = (200, 140, 60)
+            else:
+                if contact:
+                    indicator_text = "EYE CONTACT"
+                    indicator_color = (90, 220, 140)
+                else:
+                    indicator_text = "FACE"
+                    indicator_color = (160, 200, 240)
+            if last_seen:
+                age = now - last_seen
+                indicator_text += f" ({age:0.1f}s)"
+        indicator = SMALL_FONT.render(indicator_text, True, indicator_color)
+        ind_rect = indicator.get_rect(topright=(WIDTH - 16, 12))
+        pygame.draw.circle(screen, indicator_color, (ind_rect.left - 10, ind_rect.centery), 6)
+        screen.blit(indicator, ind_rect)
+
         pygame.display.flip()
         return face.signal_active
 
     def handle_turn(audio_data):
         nonlocal status_text
         nonlocal last_audio_path
+        nonlocal lookaway_interrupt
         try:
+            lookaway_interrupt = False
             face.set_expression("thinking")
             status_text = "Preparing audio"
             audio_info = save_audio(
@@ -1948,6 +2392,7 @@ def main():
             face.set_expression("thinking")
             reply, emotion = ask_ai(transcript, voice_mood=voice_mood)
 
+            last_reply_text = reply
             face.set_expression(emotion)
             status_text = "Speaking"
             trigger_prethought_flash(reply)
@@ -1976,6 +2421,7 @@ def main():
         nonlocal greeting_active
         nonlocal running
         nonlocal last_user_interaction
+        nonlocal lookaway_interrupt
 
         if greeting_active:
             return
@@ -2017,6 +2463,28 @@ def main():
         greeting_active = False
         mark_activity()
 
+    def reengage_after_lookaway():
+        nonlocal status_text
+        nonlocal lookaway_interrupt
+        nonlocal reengage_thread
+        face.set_expression("concerned")
+        face.set_talking(True)
+        status_text = "Eyes on me..."
+        speak_text("Eyes on me—I'm speaking.")
+        while pygame.mixer.music.get_busy() and running:
+            time.sleep(0.05)
+        face.set_expression("thinking")
+        status_text = "Repeating"
+        if last_reply_text:
+            speak_text(last_reply_text)
+            while pygame.mixer.music.get_busy() and running:
+                time.sleep(0.05)
+        face.set_talking(False)
+        face.set_expression("neutral")
+        status_text = DEFAULT_STATUS
+        lookaway_interrupt = False
+        reengage_thread = None
+
     play_greeting(is_initial=True)
 
     while running:
@@ -2054,6 +2522,12 @@ def main():
                             status_text = "Playing last input sample"
                         else:
                             status_text = "No recording to play"
+                elif event.key == pygame.K_v:
+                    if vision:
+                        print("Vision debug:", vision.debug_snapshot())
+                        status_text = "Vision stats printed"
+                    else:
+                        status_text = "Vision disabled"
                 elif event.key == pygame.K_LEFTBRACKET and passive:
                     passive.set_sensitivity(passive.sensitivity * 0.85)
                     status_text = f"Passive sensitivity {passive.sensitivity:.2f}x"
@@ -2103,6 +2577,66 @@ def main():
             elif evt.get("type") == "spike":
                 face.react_to_passive(evt)
 
+        gaze_events, gaze_state = (vision.poll() if vision else ([], {}))
+        if gaze_state:
+            current_gaze_state = gaze_state
+        for evt in gaze_events:
+            etype = evt.get("type")
+            if etype == "eye_contact":
+                mark_activity()
+                if lookaway_interrupt and last_reply_text and not recorder.recording:
+                    if (
+                        (reengage_thread is None or not reengage_thread.is_alive())
+                        and not pygame.mixer.music.get_busy()
+                        and (worker_thread is None or not worker_thread.is_alive())
+                    ):
+                        reengage_thread = threading.Thread(target=reengage_after_lookaway, daemon=True)
+                        reengage_thread.start()
+                        status_text = "Re-engaging..."
+                elif speech_paused_by_gaze and pygame.mixer.music.get_busy():
+                    pygame.mixer.music.unpause()
+                    if talking_paused_for_gaze:
+                        face.set_talking(True)
+                        talking_paused_for_gaze = False
+                    speech_paused_by_gaze = False
+                    speech_pause_started = None
+                    status_text = "Resuming..."
+                elif not recorder.recording and not face.talking and not pygame.mixer.music.get_busy():
+                    face.preview_expression("happy", duration=0.9)
+            elif etype == "look_away":
+                if pygame.mixer.music.get_busy():
+                    pygame.mixer.music.stop()
+                    face.set_talking(False)
+                    speech_paused_by_gaze = False
+                    talking_paused_for_gaze = False
+                    speech_pause_started = None
+                    lookaway_interrupt = True
+                    face.preview_expression("concerned", duration=1.0)
+                    status_text = "Stopped: eye contact lost"
+                elif not recorder.recording:
+                    face.preview_expression("curious", duration=0.7)
+            elif etype == "stare":
+                face.respond_to_stare()
+            elif etype == "slow_blink":
+                face.cue_blink(slow=True, length=evt.get("duration", 0.4))
+            elif etype == "squint":
+                face.preview_expression("confused", duration=1.0)
+                face.passive_target = [random.uniform(-10.0, 10.0), random.uniform(-2.0, 8.0)]
+                face.passive_timer = 0.6
+
+        if speech_paused_by_gaze and speech_pause_started:
+            if not pygame.mixer.music.get_busy():
+                speech_paused_by_gaze = False
+                talking_paused_for_gaze = False
+                speech_pause_started = None
+            elif time.time() - speech_pause_started > 8.0:
+                pygame.mixer.music.stop()
+                face.set_talking(False)
+                speech_paused_by_gaze = False
+                talking_paused_for_gaze = False
+                speech_pause_started = None
+                status_text = "Stopped: eye contact lost"
+
         busy = (
             recorder.recording
             or face.talking
@@ -2131,7 +2665,54 @@ def main():
 
     if passive:
         passive.stop()
+    if vision:
+        vision.stop()
     pygame.quit()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Gerty avatar runtime")
+    parser.add_argument(
+        "--vision-check",
+        action="store_true",
+        help="Run a short camera/eye detection diagnostic and exit.",
+    )
+    parser.add_argument(
+        "--vision-list",
+        action="store_true",
+        help="Probe camera indices and exit.",
+    )
+    parser.add_argument(
+        "--vision-duration",
+        type=float,
+        default=8.0,
+        help="Seconds to sample during the vision diagnostic.",
+    )
+    parser.add_argument(
+        "--vision-index",
+        type=int,
+        default=None,
+        help="Camera index override for the vision diagnostic.",
+    )
+    parser.add_argument(
+        "--vision-max-index",
+        type=int,
+        default=5,
+        help="Max index to probe when listing cameras.",
+    )
+    parser.add_argument(
+        "--vision-verbose",
+        action="store_true",
+        help="Print every gaze event during the diagnostic run.",
+    )
+    args = parser.parse_args()
+
+    if args.vision_list:
+        list_cameras(max_index=args.vision_max_index)
+    elif args.vision_check:
+        run_vision_check(
+            duration=args.vision_duration,
+            verbose=args.vision_verbose,
+            camera_index=args.vision_index,
+        )
+    else:
+        main()
