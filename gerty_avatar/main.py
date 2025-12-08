@@ -1689,13 +1689,18 @@ class GazeTracker:
 
     def poll(self):
         if not self.enabled:
-            return [], {"eye_contact": False, "last_seen": self.last_seen}
+            return [], {"eye_contact": False, "last_seen": self.last_seen, "contact_duration": 0.0}
         with self._lock:
             events = list(self._events)
             self._events.clear()
+            now = time.time()
+            contact_duration = (
+                max(0.0, now - self.contact_start) if self.eye_contact and self.contact_start else 0.0
+            )
             state = {
                 "eye_contact": self.eye_contact,
                 "last_seen": self.last_seen,
+                "contact_duration": contact_duration,
             }
         return events, state
 
@@ -2009,14 +2014,24 @@ class LandmarkGazeTracker:
 
     def poll(self):
         if not self.enabled:
-            return [], {"eye_contact": False, "last_seen": self.last_seen, "engagement": 0.0}
+            return [], {
+                "eye_contact": False,
+                "last_seen": self.last_seen,
+                "engagement": 0.0,
+                "contact_duration": 0.0,
+            }
         with self._lock:
             events = list(self._events)
             self._events.clear()
+            now = time.time()
+            contact_duration = (
+                max(0.0, now - self.contact_start) if self.eye_contact and self.contact_start else 0.0
+            )
             state = {
                 "eye_contact": self.eye_contact,
                 "last_seen": self.last_seen,
                 "engagement": self.engagement_ema,
+                "contact_duration": contact_duration,
             }
         return events, state
 
@@ -2528,7 +2543,7 @@ def post_process_audio(audio_data, original_sample_rate):
     
     return reverbed, target_sample_rate
 
-def speak_text(text: str, filename="reply.mp3", stop_current=True):
+def speak_text(text: str, filename="reply.mp3", stop_current=True, start_timeout=1.0) -> bool:
     print("Speaking")
     try:
         if stop_current:
@@ -2554,6 +2569,17 @@ def speak_text(text: str, filename="reply.mp3", stop_current=True):
 
     pygame.mixer.music.load(processed_filename)
     pygame.mixer.music.play()
+    started = False
+    start_limit = max(0.2, float(start_timeout))
+    start_deadline = time.time() + start_limit
+    while time.time() < start_deadline:
+        if pygame.mixer.music.get_busy():
+            started = True
+            break
+        time.sleep(0.02)
+    if not started:
+        print("Speech playback did not start")
+    return started
 
 
 def play_last_input(audio_path=INPUT_WAV):
@@ -2725,7 +2751,7 @@ def main():
         face.set_proximity_zone(passive.zone)
     running = True
     status_text = DEFAULT_STATUS
-    current_gaze_state = {"eye_contact": False, "last_seen": 0.0}
+    current_gaze_state = {"eye_contact": False, "last_seen": 0.0, "contact_duration": 0.0}
     last_reply_text = None
     lookaway_interrupt = False
     reengage_thread = None
@@ -2806,8 +2832,20 @@ def main():
             "describe my surroundings",
             "what's in the room",
             "what is in the room",
+            "what does the room look like",
+            "look around the room",
+            "look around me",
         ]
-        return any(kw in lower for kw in keywords)
+        if any(kw in lower for kw in keywords):
+            return True
+        # Fuzzy match common phrasings like "room look around me"
+        fuzzy_pairs = [
+            ("room", "look"),
+            ("room", "see"),
+            ("around me", "look"),
+            ("around me", "see"),
+        ]
+        return any(a in lower and b in lower for a, b in fuzzy_pairs)
 
     def capture_latest_frame():
         if not vision or not getattr(vision, "enabled", False):
@@ -2850,12 +2888,9 @@ def main():
             face.set_talking(True)
             scene_playback_active = True
             try:
-                speak_text(description, filename="scene_reply.mp3")
-                # If playback never starts, log and bail early
-                start_wait = time.time()
-                while time.time() - start_wait < 1.0 and not pygame.mixer.music.get_busy():
-                    time.sleep(0.05)
-                if not pygame.mixer.music.get_busy():
+                started = speak_text(description, filename="scene_reply.mp3")
+                if not started:
+                    status_text = "Room audio failed to start"
                     log_scene("Room describe playback did not start")
                 else:
                     while pygame.mixer.music.get_busy() and running:
@@ -2869,6 +2904,9 @@ def main():
         scene_thread = threading.Thread(target=worker, daemon=True)
         scene_thread.start()
         return True
+
+    def is_actively_speaking():
+        return face.talking or pygame.mixer.music.get_busy()
 
     def draw_ui(show_meter=False, level=0.0):
         face.input_level = level
@@ -2925,18 +2963,19 @@ def main():
         now = time.time()
         last_seen = current_gaze_state.get("last_seen") or 0.0
         contact = current_gaze_state.get("eye_contact", False)
+        contact_duration = current_gaze_state.get("contact_duration", 0.0) or 0.0
         if vision:
             if last_seen <= 0 or now - last_seen > 2.0:
                 indicator_text = "NO FACE"
                 indicator_color = (200, 140, 60)
             else:
                 if contact:
-                    indicator_text = "EYE CONTACT"
+                    indicator_text = f"EYE CONTACT ({contact_duration:0.1f}s)"
                     indicator_color = (90, 220, 140)
                 else:
                     indicator_text = "FACE"
                     indicator_color = (160, 200, 240)
-            if last_seen:
+            if last_seen and not contact:
                 age = now - last_seen
                 indicator_text += f" ({age:0.1f}s)"
         indicator = SMALL_FONT.render(indicator_text, True, indicator_color)
@@ -3017,7 +3056,12 @@ def main():
                 face.set_expression("neutral")
                 status_text = "Interrupted"
                 return
-            speak_text(reply)
+            started = speak_text(reply)
+            if not started:
+                status_text = "Audio playback failed"
+                face.set_talking(False)
+                face.set_expression("neutral")
+                return
 
             while pygame.mixer.music.get_busy():
                 if turn_abort.is_set():
@@ -3112,6 +3156,8 @@ def main():
         nonlocal lookaway_interrupt, speech_paused_by_gaze, talking_paused_for_gaze
         nonlocal speech_pause_started, lookaway_prompt_active, status_text
         nonlocal turn_abort
+        if not is_actively_speaking():
+            return
         if lookaway_prompt_active:
             return
         if pygame.mixer.music.get_busy():
@@ -3263,7 +3309,8 @@ def main():
                 elif not recorder.recording and not face.talking and not pygame.mixer.music.get_busy():
                     face.preview_expression("happy", duration=0.9)
             elif etype == "look_away":
-                interrupt_for_lookaway()
+                if is_actively_speaking():
+                    interrupt_for_lookaway()
             elif etype == "stare":
                 face.respond_to_stare()
             elif etype == "blink":
@@ -3355,7 +3402,7 @@ def main():
                 scene_state_msg = state_reason
                 log_scene(state_reason)
 
-        if vision and pygame.mixer.music.get_busy() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active and not scene_playback_active:
+        if vision and is_actively_speaking() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active and not scene_playback_active:
             interrupt_for_lookaway()
 
         if not passive and gaze_state:
