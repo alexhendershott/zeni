@@ -1295,10 +1295,43 @@ def main():
     greeting_active = False
     last_user_interaction = time.time()
     signal_message_cooldown = 0.0
+    prethought_flash = None
 
     def mark_activity():
         nonlocal last_user_interaction
         last_user_interaction = time.time()
+
+    def pick_prethought_fragment(reply_text: str):
+        tokens = [w.strip(".,!?;:") for w in reply_text.split() if w.strip(".,!?;:")]
+        if not tokens:
+            return None
+        word = random.choice(tokens)[:12]
+        glitch_chars = ["|", "/", "\\", "#", "_", "~"]
+        glitched = []
+        for ch in word:
+            roll = random.random()
+            if roll < 0.2:
+                glitched.append(random.choice(glitch_chars))
+            elif roll < 0.45:
+                glitched.append(ch.upper())
+            else:
+                glitched.append(ch)
+        if random.random() < 0.35:
+            glitched.append(random.choice(glitch_chars))
+        return "".join(glitched)
+
+    def trigger_prethought_flash(reply_text: str):
+        nonlocal prethought_flash
+        fragment = pick_prethought_fragment(reply_text)
+        if not fragment:
+            return
+        prethought_flash = {
+            "text": fragment,
+            "timer": 0.0,
+            "duration": 0.05,  # a couple of frames
+            "offset": (random.randint(-24, 24), random.randint(-12, 12)),
+            "alpha": random.randint(160, 230),
+        }
 
     def draw_ui(show_meter=False, level=0.0):
         face.input_level = level
@@ -1322,6 +1355,27 @@ def main():
         if tint[3] > 0:
             overlay.fill(tint)
             screen.blit(overlay, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        if prethought_flash:
+            flicker = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            haze_alpha = max(30, prethought_flash["alpha"] // 3)
+            flicker.fill((40, 40, 90, haze_alpha))
+            word = prethought_flash["text"]
+            jitter_x = random.randint(-2, 2)
+            jitter_y = random.randint(-2, 2)
+            text = SMALL_FONT.render(word, True, (245, 245, 255))
+            text_rect = text.get_rect(
+                center=(
+                    WIDTH // 2 + prethought_flash["offset"][0] + jitter_x,
+                    80 + prethought_flash["offset"][1] + jitter_y,
+                )
+            )
+            flicker.blit(text, text_rect)
+            ghost = text.copy()
+            ghost.set_alpha(80)
+            flicker.blit(ghost, text_rect.move(random.randint(-3, 3), random.randint(-1, 2)))
+            flicker.set_alpha(prethought_flash["alpha"])
+            screen.blit(flicker, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
 
         text_surface = FONT.render(status_text, True, (220, 220, 240))
         screen.blit(text_surface, (20, HEIGHT - 40))
@@ -1362,6 +1416,10 @@ def main():
 
             face.set_expression(emotion)
             status_text = "Speaking"
+            trigger_prethought_flash(reply)
+            # Draw once immediately so the pre-thought flash renders even if speech starts fast
+            draw_ui()
+            time.sleep(0.02)
             face.set_talking(True)
             speak_text(reply)
 
@@ -1500,6 +1558,10 @@ def main():
             signal_message_cooldown = 8.0
         if signal_message_cooldown > 0:
             signal_message_cooldown -= dt
+        if prethought_flash:
+            prethought_flash["timer"] += dt
+            if prethought_flash["timer"] >= prethought_flash["duration"]:
+                prethought_flash = None
 
         for event in events:
             if event.type == pygame.USEREVENT + 1:
