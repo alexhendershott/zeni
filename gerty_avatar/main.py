@@ -1235,6 +1235,24 @@ def main():
         face.input_level = level
         face.draw(screen)
 
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        tint = (0, 0, 0, 0)
+
+        if face.expression in ("happy", "excited", "curious"):
+            tint = (50, 40, 80, 40)
+        elif face.expression in ("sad", "concerned"):
+            tint = (10, 30, 80, 60)
+        elif face.expression == "confused":
+            tint = (80, 60, 20, 50)
+        elif face.expression == "surprised":
+            tint = (120, 80, 20, 70)
+        elif face.signal_active:
+            tint = (150, 30, 30, 90)
+
+        if tint[3] > 0:
+            overlay.fill(tint)
+            screen.blit(overlay, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
         if show_meter:
             max_width = WIDTH - 40
             rect = pygame.Rect(20, HEIGHT - 70, max_width, 10)
