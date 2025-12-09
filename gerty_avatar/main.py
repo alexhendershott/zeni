@@ -48,7 +48,7 @@ INPUT_DEVICE_PREF = os.getenv("AUDIO_INPUT_DEVICE")
 
 WIDTH = 640
 HEIGHT = 480
-DEFAULT_FACE_SCAN_INTERVAL = 30.0
+DEFAULT_FACE_SCAN_INTERVAL = 15.0
 
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -64,6 +64,19 @@ GREETING_MESSAGES = [
     "The system says you are present. Is this true?",
     "Just checking in—ready whenever you are.",
     "Speak. I am already watching.",
+]
+
+CREEPY_FACE_OPENERS = [
+    "You look like you didn’t sleep.",
+    "You look worn out today.",
+    "You look beat right now.",
+    "You look tired as hell.",
+    "You look a bit off today.",
+    "You look drained.",
+    "You look like you’re running on fumes.",
+    "You look kind of wrecked today.",
+    "You look like today hit you hard.",
+    "You look rough around the edges today.",
 ]
 
 EMOTIONS = [
@@ -130,6 +143,20 @@ UNSETTLING_THOUGHTS = [
     "signal mismatch",
     "echo anomaly",
     "is the operator still present",
+]
+
+FATAL_MESSAGES = [
+    "FATAL: containment.flag ≠ expected",
+    "CRIT: reactor.core_temp > safe_limit",
+    "ERR42: auth.token_hash != stored_hash",
+    "FATAL17: kernel.lock_state == UNDEFINED",
+    "PANIC: sync.vector_length < required_min",
+    "ERR99: module.io_channel returned NULL",
+    "CRASH12: cache.index_ptr out of range",
+    "FAILX: payload.header_crc != computed_crc",
+    "FATAL03: session.heartbeat_count dropped to zero",
+    "ALERT7: drone.nav_state == UNKNOWN",
+    "ERR208: pipeline.output_frame missing metadata",
 ]
 
 
@@ -2576,6 +2603,31 @@ def describe_face_from_frame(frame: np.ndarray) -> str:
         raise RuntimeError("No face description returned from vision model")
     return last_description
 
+def format_face_line(description: str) -> str:
+    """
+    Turn a raw model description into a short, direct sentence without adding new details.
+    """
+    cleaned = (description or "").strip().rstrip(".")
+    if not cleaned:
+        return "I see you."
+
+    def _cap(s: str) -> str:
+        return s[0].upper() + s[1:] if s else s
+
+    lower = cleaned.lower()
+    # If model already wrote a full sentence starting with "i see" or "you are / you're", keep it.
+    if lower.startswith("i see"):
+        return _cap(cleaned) + "."
+    if lower.startswith("you are "):
+        return f"I see {cleaned}."
+    if lower.startswith("you're "):
+        return f"I see {cleaned}."
+
+    # Otherwise, prepend a single "I see you're ..."
+    if len(cleaned) > 1:
+        cleaned = cleaned[0].lower() + cleaned[1:]
+    return f"I see you're {cleaned}."
+
 def post_process_audio(audio_data, original_sample_rate):
     """
     Apply audio post-processing:
@@ -2848,6 +2900,7 @@ def main():
     scene_state_msg = None
     scene_playback_active = False
     pending_scene_request = False
+    pending_scene_preamble = False
     try:
         face_scan_interval = float(os.getenv("FACE_SCAN_INTERVAL", str(DEFAULT_FACE_SCAN_INTERVAL)))
     except ValueError:
@@ -2856,6 +2909,7 @@ def main():
     face_scan_active = False
     pending_face_scan = False
     last_face_scan = time.time()
+    face_scan_completed = False
 
     def mark_activity():
         nonlocal last_user_interaction
@@ -2928,6 +2982,23 @@ def main():
         ]
         return any(a in lower and b in lower for a, b in fuzzy_pairs)
 
+    def wants_face_description(text: str) -> bool:
+        lower = text.lower()
+        phrases = [
+            "describe me",
+            "describe my face",
+            "describe the person in front of you",
+            "what do i look like",
+            "what do i look like to you",
+            "describe the person you see",
+            "describe my appearance",
+            "what do you see in my face",
+            "describe who is in front of you",
+        ]
+        if any(p in lower for p in phrases):
+            return True
+        return ("describe" in lower and "face" in lower) or ("describe" in lower and "me" in lower and "look" in lower)
+
     def capture_latest_frame():
         if not vision or not getattr(vision, "enabled", False):
             return None
@@ -2940,10 +3011,11 @@ def main():
             print("Failed to grab frame from vision:", exc)
             return None
 
-    def launch_room_description(reason="auto"):
-        nonlocal scene_thread, last_scene_trigger, status_text, pending_scene_request
+    def launch_room_description(reason="auto", lonely_preamble=False):
+        nonlocal scene_thread, last_scene_trigger, status_text, pending_scene_request, pending_scene_preamble
         if scene_thread is not None and scene_thread.is_alive():
             pending_scene_request = True
+            pending_scene_preamble = pending_scene_preamble or lonely_preamble
             log_scene(f"Room describe queued ({reason}); worker busy")
             return False
         frame = capture_latest_frame()
@@ -2965,6 +3037,8 @@ def main():
                 status_text = "Vision describe failed"
                 log_scene(f"Room describe failed: {exc}")
                 return
+            if lonely_preamble:
+                description = f"Hello? Is anyone there? I don't see anyone. {description}"
             log_scene(f"Room describe ok: {description[:80]}")
             face.set_talking(True)
             scene_playback_active = True
@@ -2988,7 +3062,7 @@ def main():
 
     def launch_face_scan(reason="auto"):
         nonlocal face_scan_thread, last_face_scan, status_text, pending_face_scan, face_scan_active
-        nonlocal scene_state_msg
+        nonlocal scene_state_msg, face_scan_completed
         if face_scan_thread is not None and face_scan_thread.is_alive():
             pending_face_scan = True
             log_scene(f"Face describe queued ({reason}); worker busy")
@@ -3036,10 +3110,9 @@ def main():
                 face_scan_active = False
                 face_scan_thread = None
                 return
-            creepy_line = (
-                "You look a little rough today. "
-                f"{description.rstrip('.')}. I seeeee you."
-            )
+            face_line = format_face_line(description)
+            opener = random.choice(CREEPY_FACE_OPENERS)
+            creepy_line = f"{opener} {face_line} I am always watching, smile."
             log_scene(f"Face describe ok ({reason}): {description[:80]}")
             face.set_talking(True)
             try:
@@ -3061,6 +3134,8 @@ def main():
         face_scan_active = True
         face_scan_thread = threading.Thread(target=worker, daemon=True)
         face_scan_thread.start()
+        if reason == "scheduled":
+            face_scan_completed = True
         return True
 
     def is_actively_speaking():
@@ -3204,10 +3279,22 @@ def main():
                     face.set_expression("sad")
                     return
                 status_text = "Describing room..."
-                started = launch_room_description(reason="manual")
+                started = launch_room_description(reason="manual", lonely_preamble=False)
                 if not started:
                     pending_scene_request = True
+                    pending_scene_preamble = False
                     status_text = "Room describe queued..."
+                return
+            if wants_face_description(transcript):
+                log_scene("Manual face describe request")
+                if not vision or not getattr(vision, "enabled", False):
+                    status_text = "Vision disabled"
+                    face.set_expression("sad")
+                    return
+                status_text = "Studying your face..."
+                if not launch_face_scan(reason="manual"):
+                    pending_face_scan = True
+                    status_text = "Face describe queued..."
                 return
 
             status_text = "Thinking"
@@ -3535,7 +3622,12 @@ def main():
         scene_busy = scene_thread is not None and scene_thread.is_alive()
         face_scan_busy = face_scan_thread is not None and face_scan_thread.is_alive()
 
-        if not face_scan_active and not face_scan_busy and (now - last_face_scan) >= face_scan_interval:
+        if (
+            not face_scan_completed
+            and not face_scan_active
+            and not face_scan_busy
+            and (now - last_face_scan) >= face_scan_interval
+        ):
             pending_face_scan = True
 
         vision_ready = vision_task_available()
@@ -3549,11 +3641,12 @@ def main():
         ):
             no_face_elapsed = 0.0
             log_scene("Triggering room description")
-            launch_room_description()
+            launch_room_description(lonely_preamble=True)
         elif pending_scene_request and can_describe_room and not scene_busy:
             pending_scene_request = False
             log_scene("Launching queued room description")
-            launch_room_description(reason="queued")
+            launch_room_description(reason="queued", lonely_preamble=pending_scene_preamble)
+            pending_scene_preamble = False
         else:
             state_reason = "idle"
             if not vision or not getattr(vision, "enabled", False):
@@ -3630,7 +3723,7 @@ def main():
         level_source = recorder.level() if recorder.recording else passive_level
         signal_now = draw_ui(recorder.recording, level_source)
         if signal_now and signal_message_cooldown <= 0 and not greeting_active:
-            status_text = "FATAL: containment.flag ≠ expected"
+            status_text = random.choice(FATAL_MESSAGES)
             signal_message_cooldown = 8.0
         if signal_message_cooldown > 0:
             signal_message_cooldown -= dt
