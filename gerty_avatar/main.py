@@ -48,7 +48,8 @@ INPUT_DEVICE_PREF = os.getenv("AUDIO_INPUT_DEVICE")
 
 WIDTH = 640
 HEIGHT = 480
-DEFAULT_FACE_SCAN_INTERVAL = 15.0
+DEFAULT_FACE_SCAN_INTERVAL = 45.0
+NAME_FORGET_TIMEOUT = 600.0
 
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -781,10 +782,13 @@ class Face:
             # central listening core
             center = (WIDTH // 2 + int(self.head_offset[0]), HEIGHT // 2 + int(self.head_offset[1]))
             r = 40 + int(60 * min(1.0, self.input_level * 6.0))
-            intensity = int(80 + 150 * min(1.0, self.input_level * 6.0))
+            raw_intensity = 80 + 150 * min(1.0, self.input_level * 6.0)
+            intensity = max(0, min(255, int(raw_intensity)))
+            highlight = max(0, min(255, intensity + 40))
+            glow = max(0, min(255, intensity + 90))
             core = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
             pygame.draw.circle(core, (intensity, intensity, intensity + 40, 190), center, r)
-            pygame.draw.circle(core, (intensity + 40, intensity + 40, intensity + 90, 120), center, r + 20, 4)
+            pygame.draw.circle(core, (highlight, highlight, glow, 120), center, r + 20, 4)
             core.set_alpha(160)
             surf.blit(core, (0, 0))
 
@@ -1617,9 +1621,9 @@ class GazeTracker:
         self.stare_threshold = stare_threshold
         if lookaway_grace is None:
             try:
-                lookaway_grace = float(os.getenv("LOOKAWAY_GRACE", "0.05"))
+                lookaway_grace = float(os.getenv("LOOKAWAY_GRACE", "0.2"))
             except Exception:
-                lookaway_grace = 0.05
+                lookaway_grace = 0.2
         self.lookaway_grace = max(0.0, float(lookaway_grace))
 
         self._cap = None
@@ -1822,7 +1826,8 @@ class GazeTracker:
         norm_dx = abs(cx - frame_w * 0.5) / max(1.0, frame_w * 0.5)
         norm_dy = abs(cy - frame_h * 0.5) / max(1.0, frame_h * 0.5)
         size_ratio = (w * h) / float(max(1.0, frame_w * frame_h))
-        return norm_dx < 0.48 and norm_dy < 0.42 and size_ratio > 0.008
+        # More tolerant so brief glance away doesn't drop contact immediately
+        return norm_dx < 0.55 and norm_dy < 0.5 and size_ratio > 0.006
 
     def _handle_no_face(self, now):
         if self.eye_contact:
@@ -1947,13 +1952,13 @@ class LandmarkGazeTracker:
         self.stare_threshold = stare_threshold
         if lookaway_grace is None:
             try:
-                lookaway_grace = float(os.getenv("LOOKAWAY_GRACE", "0.05"))
+                lookaway_grace = float(os.getenv("LOOKAWAY_GRACE", "0.2"))
             except Exception:
-                lookaway_grace = 0.05
+                lookaway_grace = 0.2
         self.lookaway_grace = max(0.0, float(lookaway_grace))
 
-        self.contact_yaw_limit = 0.8
-        self.contact_pitch_limit = 0.6
+        self.contact_yaw_limit = 1.0
+        self.contact_pitch_limit = 0.75
         self.blink_threshold = 0.23
         self.squint_threshold = 0.18
         self.blink_min_duration = 0.12
@@ -2406,7 +2411,7 @@ def transcribe_audio(filename=INPUT_WAV):
     print("You said:", text)
     return text
 
-def ask_ai(text: str, voice_mood: Union[str, None] = None):
+def ask_ai(text: str, voice_mood: Union[str, None] = None, user_name: Optional[str] = None, mention_name: bool = False):
     """
     Ask the model to reply and give a simple emotion tag.
     """
@@ -2418,10 +2423,15 @@ def ask_ai(text: str, voice_mood: Union[str, None] = None):
     elif voice_mood == "curious":
         mood_sentence = "The user sounded quiet and curious, respond gently. "
 
+    name_sentence = ""
+    if mention_name and user_name:
+        name_sentence = f"The user's name is {user_name}. Mention it once in this reply, briefly. "
+
     system_prompt = (
         "You are a exhausted station assistant called Zeni. "
         "Reply succinctly in English, even if the user speaks another language. "
         f"{mood_sentence}"
+        f"{name_sentence}"
         "Always return a JSON object with fields reply and emotion. "
         f"Emotion must be one of {emotion_list}. "
         "Choose emotions that match the tone of your reply."
@@ -2901,6 +2911,10 @@ def main():
     scene_playback_active = False
     pending_scene_request = False
     pending_scene_preamble = False
+    user_name = None
+    name_last_seen = 0.0
+    expecting_name = False
+    name_prompted = False
     try:
         face_scan_interval = float(os.getenv("FACE_SCAN_INTERVAL", str(DEFAULT_FACE_SCAN_INTERVAL)))
     except ValueError:
@@ -2917,6 +2931,9 @@ def main():
         if idle_gap > 2.0:
             dreams.snap_out()
         last_user_interaction = time.time()
+        if user_name:
+            nonlocal name_last_seen
+            name_last_seen = last_user_interaction
 
     def log_scene(msg: str):
         ts = time.time() - session_start
@@ -3242,6 +3259,7 @@ def main():
         nonlocal lookaway_interrupt
         nonlocal turn_abort
         nonlocal pending_scene_request
+        nonlocal user_name, name_last_seen, expecting_name, name_prompted
         try:
             turn_abort.clear()
             lookaway_interrupt = False
@@ -3272,6 +3290,44 @@ def main():
                 face.set_expression("neutral")
                 return
 
+            if expecting_name:
+                raw = transcript.strip()
+                words = [w.strip(",.!?;:") for w in raw.split() if w.strip(",.!?;:")]
+                if not words:
+                    status_text = "Did not catch a name"
+                    face.set_expression("neutral")
+                    return
+                candidate = " ".join(words[:3])
+                candidate = candidate[:32]
+                user_name = candidate
+                name_last_seen = time.time()
+                expecting_name = False
+                status_text = "Noted."
+                face.set_expression("happy")
+                face.set_talking(True)
+                speak_text(f"Alright, {user_name}.")
+                while pygame.mixer.music.get_busy() and running:
+                    time.sleep(0.05)
+                face.set_talking(False)
+                face.set_expression("neutral")
+                status_text = DEFAULT_STATUS
+                mark_activity()
+                return
+
+            if user_name is None and not expecting_name and not name_prompted:
+                name_prompted = True
+                expecting_name = True
+                status_text = "What's your name?"
+                face.set_expression("curious")
+                face.set_talking(True)
+                speak_text("Before I answer...what should I call you? What is your name?")
+                while pygame.mixer.music.get_busy() and running:
+                    time.sleep(0.05)
+                face.set_talking(False)
+                face.set_expression("neutral")
+                status_text = DEFAULT_STATUS
+                return
+
             if wants_room_description(transcript):
                 log_scene("Manual room describe request")
                 if not vision or not getattr(vision, "enabled", False):
@@ -3299,7 +3355,13 @@ def main():
 
             status_text = "Thinking"
             face.set_expression("thinking")
-            reply, emotion = ask_ai(transcript, voice_mood=voice_mood)
+            mention_name = False
+            if user_name and (time.time() - name_last_seen) < NAME_FORGET_TIMEOUT:
+                if random.random() < 0.25:
+                    mention_name = True
+                    name_last_seen = time.time()
+
+            reply, emotion = ask_ai(transcript, voice_mood=voice_mood, user_name=user_name, mention_name=mention_name)
             if turn_abort.is_set():
                 status_text = "Interrupted"
                 face.set_expression("neutral")
@@ -3442,7 +3504,7 @@ def main():
             try:
                 face.set_expression("concerned")
                 face.set_talking(True)
-                speak_text("Hey! Eyes on me please. I am speaking.")
+                speak_text("Hey! Eyes on me. I was speaking.")
                 while pygame.mixer.music.get_busy() and running:
                     time.sleep(0.05)
             finally:
@@ -3680,6 +3742,11 @@ def main():
             launched = launch_face_scan(reason="scheduled")
             if not launched:
                 pending_face_scan = True
+
+        if user_name and not expecting_name:
+            if (time.time() - name_last_seen) > NAME_FORGET_TIMEOUT:
+                user_name = None
+                name_prompted = False
 
         if vision and is_actively_speaking() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active and not scene_playback_active:
             interrupt_for_lookaway()
