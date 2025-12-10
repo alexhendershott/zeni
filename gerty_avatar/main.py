@@ -48,7 +48,7 @@ INPUT_DEVICE_PREF = os.getenv("AUDIO_INPUT_DEVICE")
 
 WIDTH = 640
 HEIGHT = 480
-DEFAULT_FACE_SCAN_INTERVAL = 45.0
+DEFAULT_FACE_SCAN_INTERVAL = 20.0
 NAME_FORGET_TIMEOUT = 600.0
 
 pygame.init()
@@ -353,6 +353,10 @@ class Face:
         self.passive_timer = 0.0
         self.sweep = None
         self.proximity_zone = "far"
+        self.tracking_active = False
+        self.tracking_target = [0.0, 0.0]
+        self.current_scale = 1.0
+        self.target_scale = 1.0
 
     def set_expression(self, expr):
         if expr not in EMOTION_SET:
@@ -685,18 +689,48 @@ class Face:
                 if abs(self.passive_offset[i]) < 0.2:
                     self.passive_offset[i] = 0.0
 
+    def update_tracking(self, target_pos, face_size=0.0):
+        if target_pos is None:
+            self.tracking_active = False
+            self.target_scale = 1.0
+            return
+        self.tracking_active = True
+        
+        # Exaggerate motion:
+        # User is at -1..1. Screen width 640.
+        # Let's allow head to move +/- 180 pixels.
+        scale_x = 180.0
+        scale_y = 90.0
+        self.tracking_target = [target_pos[0] * scale_x, target_pos[1] * scale_y]
+        
+        # Calibrate size
+        # face_size usually 0.02 (far) to 0.30 (very close)
+        # We want scale 1.0 at ~0.06
+        # Min scale 0.6, Max 2.2
+        raw_scale = 0.5 + 6.0 * face_size
+        self.target_scale = max(0.6, min(2.4, raw_scale))
+
     def _update_head_motion(self, dt):
+        # Smooth scale
+        diff = self.target_scale - self.current_scale
+        self.current_scale += diff * min(1.0, dt * 2.5)
+        
         jitter = 5 if self.talking else 2
         cooldown = 0.25 if self.talking else 0.7
         settle = 9.0 if self.talking else 4.5
-
-        self.head_timer -= dt
-        if self.head_timer <= 0:
-            self.head_target = [
-                random.uniform(-jitter, jitter),
-                random.uniform(-jitter, jitter),
-            ]
-            self.head_timer = random.uniform(cooldown, cooldown + 0.25)
+        
+        if self.tracking_active and not self.talking:
+            self.head_target = self.tracking_target
+            self.head_timer = 0.0  # Keep timer low so we don't block
+            settle = 3.5  # Smoother/slower follow
+        else:
+            self.head_timer -= dt
+            if self.head_timer <= 0:
+                self.head_target = [
+                    random.uniform(-jitter, jitter),
+                    random.uniform(-jitter, jitter),
+                ]
+                self.head_timer = random.uniform(cooldown, cooldown + 0.25)
 
         for i in (0, 1):
             delta = self.head_target[i] - self.head_offset[i]
@@ -769,7 +803,7 @@ class Face:
             base_center[0] + int(self.shadow_offset[0]),
             base_center[1] + int(self.shadow_offset[1]),
         )
-        radius = 140
+        radius = 140 * self.current_scale
 
         base = 28
         pulse_speed = 3.2 if self.talking else 1.6
@@ -787,8 +821,12 @@ class Face:
             highlight = max(0, min(255, intensity + 40))
             glow = max(0, min(255, intensity + 90))
             core = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            pygame.draw.circle(core, (intensity, intensity, intensity + 40, 190), center, r)
-            pygame.draw.circle(core, (highlight, highlight, glow, 120), center, r + 20, 4)
+            # Ensure color values are valid ints 0-255
+            c_int = max(0, min(255, int(intensity)))
+            c_high = max(0, min(255, int(highlight)))
+            c_glow = max(0, min(255, int(glow)))
+            pygame.draw.circle(core, (c_int, c_int, max(0, min(255, c_int + 40)), 190), center, r)
+            pygame.draw.circle(core, (c_high, c_high, c_glow, 120), center, r + 20, 4)
             core.set_alpha(160)
             surf.blit(core, (0, 0))
 
@@ -1019,18 +1057,20 @@ class Face:
             surf.blit(band_surface, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
     
     def _draw_eyes(self, surf, center, style, color=(220, 220, 240)):
-        eye_y = center[1] - 40 + style.get("eye_drop", 0)
-        eye_offset_x = 45
-        base = 18 * style.get("eye_scale", 1.0)
+        scale = self.current_scale
+        base_y_offset = (style.get("eye_drop", 0) - 40) * scale
+        eye_y = center[1] + base_y_offset
+        eye_offset_x = 45 * scale
+        base = 18 * style.get("eye_scale", 1.0) * scale
 
         if self.blinking:
             h = 4
             for sign in (-1, 1):
-                x = center[0] + sign * eye_offset_x
+                x = int(center[0] + sign * eye_offset_x)
                 pygame.draw.rect(
                     surf,
                     color,
-                    pygame.Rect(x - base, eye_y - 2, base * 2, h),
+                    pygame.Rect(int(x - base), int(eye_y - 2), int(base * 2), int(h)),
                 )
             return
 
@@ -1039,29 +1079,29 @@ class Face:
             brow_len = int(base * 2.0)
             tilt = int(base * 0.4)
 
-            lx = center[0] - eye_offset_x
+            lx = int(center[0] - eye_offset_x)
             pygame.draw.line(
                 surf,
                 color,
-                (lx - brow_len // 2, brow_y + tilt),
-                (lx + brow_len // 2, brow_y),
+                (int(lx - brow_len // 2), int(brow_y + tilt)),
+                (int(lx + brow_len // 2), int(brow_y)),
                 3,
             )
 
-            rx = center[0] + eye_offset_x
+            rx = int(center[0] + eye_offset_x)
             pygame.draw.line(
                 surf,
                 color,
-                (rx - brow_len // 2, brow_y),
-                (rx + brow_len // 2, brow_y + tilt),
+                (int(rx - brow_len // 2), int(brow_y)),
+                (int(rx + brow_len // 2), int(brow_y + tilt)),
                 3,
             )
 
         for sign in (-1, 1):
-            x = center[0] + sign * eye_offset_x
+            x = int(center[0] + sign * eye_offset_x)
             w = int(base * 0.9)
             h = int(base * 1.45)
-            rect = pygame.Rect(x - w, eye_y - h, w * 2, h * 2)
+            rect = pygame.Rect(x - w, int(eye_y - h), w * 2, h * 2)
             pygame.draw.ellipse(surf, color, rect)
 
     def _talk_amount(self):
@@ -1072,20 +1112,22 @@ class Face:
         return 0.08 + 0.03 * math.sin(self.talk_timer * 1.6 + self.talk_phase)
 
     def _draw_mouth(self, surf, center, style, talk_override=None, color=(220, 220, 240)):
+        scale = self.current_scale
         m = style.get("mouth", "flat")
-        width = style.get("mouth_width", 90)
+        width = style.get("mouth_width", 90) * scale
         if self.talking:
             width *= 1.0 + 0.08 * math.sin(self.talk_timer * 5.3 + self.talk_phase)
         width = int(width)
-        y = center[1] + 40
+        y = center[1] + 40 * scale
         talk = self._talk_amount() if talk_override is None else talk_override
-        height = 35 + talk * 30
+        talk = self._talk_amount() if talk_override is None else talk_override
+        height = (35 + talk * 30) * scale
 
         if m == "smile":
-            rect = pygame.Rect(center[0] - width, y - height, width * 2, height * 2)
+            rect = pygame.Rect(int(center[0] - width), int(y - height), int(width * 2), int(height * 2))
             pygame.draw.arc(surf, color, rect, 3.24, 6.1, 4)
         elif m == "frown":
-            rect = pygame.Rect(center[0] - width, y - int(height * 0.8), width * 2, int(height * 1.8))
+            rect = pygame.Rect(int(center[0] - width), int(y - int(height * 0.8)), int(width * 2), int(height * 1.8))
             pygame.draw.arc(surf, color, rect, 0.15, 2.99, 5)
         elif m == "line":
             pygame.draw.rect(
@@ -1096,14 +1138,14 @@ class Face:
             )
         elif m == "o":
             r = max(14, int(18 + talk * 20))
-            pygame.draw.circle(surf, color, (center[0], y + 10), r, 3)
+            pygame.draw.circle(surf, color, (int(center[0]), int(y + 10)), int(r), 3)
         elif m == "smirk":
             # Simple asymmetric smile - one clean arc shifted to one side
             smirk_offset = int(width * 0.3)
             rect = pygame.Rect(
-                center[0] - width + smirk_offset, 
-                y - int(height * 0.6), 
-                width * 2, 
+                int(center[0] - width + smirk_offset), 
+                int(y - int(height * 0.6)), 
+                int(width * 2), 
                 int(height * 1.4)
             )
             pygame.draw.arc(surf, color, rect, 3.3, 5.95, 5)
@@ -1118,7 +1160,7 @@ class Face:
             pygame.draw.lines(surf, color, False, pts, 4)
         elif m == "thinking":
             arc_h = int(height * 0.7)
-            rect = pygame.Rect(center[0] - width, y - arc_h // 3, width * 2, arc_h)
+            rect = pygame.Rect(int(center[0] - width), int(y - arc_h // 3), int(width * 2), arc_h)
             pygame.draw.arc(surf, color, rect, 3.4, 5.9, 4)
         else:
             arc_h = int(height * 0.6)
@@ -1137,6 +1179,10 @@ class DreamMonologue:
         self.snap_pulse = None
         self.idle_stage = "soft"
         self.last_idle_time = 0.0
+        self.current_image = None
+        self.pending_image = None
+        self.image_alpha = 0.0
+        self.image_loaded_time = 0.0
 
     def reset(self):
         self.fragments.clear()
@@ -1226,6 +1272,45 @@ class DreamMonologue:
             print("Dream prompt failed:", exc)
         return None
 
+    def _fetch_dream_image(self, prompt_text):
+        try:
+            print(f"Generating dream image for: {prompt_text}")
+            import urllib.request
+            import io
+            
+            # Use DALL-E 3
+            try:
+                response = client.images.generate(
+                    model="dall-e-3",
+                    prompt=f"Abstract digital glitch art, dark, eerie. Theme: {prompt_text}. Minimalist, sci-fi, wireframe, datamosh.",
+                    size="1024x1024",
+                    quality="standard",
+                    n=1,
+                )
+            except AttributeError:
+                 # Fallback for older library version or different client structure
+                response = client.images.generate(
+                    model="dall-e-3",
+                    prompt=f"Abstract digital glitch art. Theme: {prompt_text}",
+                    size="1024x1024",
+                    quality="standard",
+                    n=1,
+                )
+
+            image_url = response.data[0].url
+            
+            with urllib.request.urlopen(image_url) as url:
+                image_data = url.read()
+            
+            image_file = io.BytesIO(image_data)
+            surf = pygame.image.load(image_file).convert_alpha()
+            scaled = pygame.transform.smoothscale(surf, (WIDTH, HEIGHT))
+            self.pending_image = scaled
+            print("Dream image ready.")
+        except Exception as exc:
+            print("Dream image generation failed:", exc)
+
+
     def _spawn_overlay(self, text, stage):
         edge = random.choice(["top", "bottom", "left", "right"])
         margin = 24
@@ -1281,6 +1366,9 @@ class DreamMonologue:
             thought = self._generate_dream_line()
             if thought:
                 self.fragments.append({"text": thought, "stage": self.idle_stage})
+                # Spawn visual thread
+                t = threading.Thread(target=self._fetch_dream_image, args=(thought,), daemon=True)
+                t.start()
             self.next_ai_time = now + random.uniform(85.0, 100.0)
 
         self.flash_timer -= dt
@@ -1297,6 +1385,26 @@ class DreamMonologue:
             if overlay["timer"] <= overlay["duration"]:
                 alive_overlays.append(overlay)
         self.overlays = alive_overlays
+        
+        # Image crossfade
+        if self.current_image:
+            self.image_alpha = min(255.0, self.image_alpha + dt * 60.0)
+            if self.pending_image and self.image_alpha >= 255.0 and (now - self.image_loaded_time) > 15.0:
+                 # Start fading out to switch
+                 pass # handled by just swapping when ready?
+                 # ideally we want to hold the image for a bit.
+
+        if self.pending_image:
+             if self.current_image is None:
+                 self.current_image = self.pending_image
+                 self.pending_image = None
+                 self.image_alpha = 0.0
+                 self.image_loaded_time = now
+             else:
+                 # Simple cut for now or fade out old?
+                 # Let's fade out old first
+                 pass 
+
 
         if self.snap_pulse:
             self.snap_pulse["timer"] += dt
@@ -1318,6 +1426,12 @@ class DreamMonologue:
                 2,
             )
             surf.blit(pulse, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+
+        if self.current_image:
+            # Draw dream image with alpha
+            if self.image_alpha > 0:
+                self.current_image.set_alpha(int(self.image_alpha * 0.4)) # max 40% opacity so face is visible
+                surf.blit(self.current_image, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
 
         if not self.overlays:
             return
@@ -1448,7 +1562,34 @@ class SoundManager:
 
         # Modulate drone volume slightly
         drone_vol = 0.3 + 0.1 * math.sin(time.time() * 0.5)
-        self.drone_channel.set_volume(max(0.1, min(0.5, drone_vol)))
+        
+        # Spatial Panning
+        pan = 0.0
+        if hasattr(self.face, "tracking_active") and self.face.tracking_active:
+             # Estimated normalized X (-1 to 1)
+             # tracking_target[0] is roughly -180 to 180 now
+             pan = max(-1.0, min(1.0, self.face.tracking_target[0] / 150.0))
+        
+        # Calculate left/right volumes (pan ranges -1 to 1)
+        # Center = balanced. Left = louder left.
+        left_bias = 1.0 - max(0.0, pan)    # pan=1 -> left=0. pan=-1 -> left=1
+        right_bias = 1.0 - max(0.0, -pan)  # pan=1 -> right=1. pan=-1 -> right=0
+        
+        # Smooth bias curve
+        # pan=0 -> l=1, r=1 ? No, we want constant power roughly.
+        # Linear pan law:
+        # L = 0.5 * (1 - pan) ? No, that drops center level.
+        # Let's use simple weighting:
+        # center: 0.7, 0.7
+        # left: 1.0, 0.4
+        
+        base_l = 0.7 - 0.3 * pan
+        base_r = 0.7 + 0.3 * pan
+        
+        l_vol = base_l * drone_vol
+        r_vol = base_r * drone_vol
+        
+        self.drone_channel.set_volume(l_vol, r_vol)
 
     def _generate_drone(self, freq=55.0, duration=5.0, rate=44100):
         length = int(duration * rate)
@@ -1515,7 +1656,7 @@ class AudioRecorder:
         self._level = 0.0
 
         # VAD settings
-        self.vad_enabled = True
+        self.vad_enabled = False
         self.vad_threshold = 0.015
         self.silence_timeout = 1.0  # seconds of silence before stop
         self.pre_roll_duration = 0.6
@@ -2165,6 +2306,8 @@ class LandmarkGazeTracker:
         self.last_seen = 0.0
         self.contact_ema = 0.0
         self.engagement_ema = 0.0
+        self.user_position = (0.0, 0.0)
+        self.face_size = 0.0
 
         self.blink_start = None
         self.squint_timer = 0.0
@@ -2246,6 +2389,8 @@ class LandmarkGazeTracker:
                 "last_seen": self.last_seen,
                 "engagement": self.engagement_ema,
                 "contact_duration": contact_duration,
+                "user_position": self.user_position,
+                "face_size": self.face_size,
             }
         return events, state
 
@@ -2334,6 +2479,26 @@ class LandmarkGazeTracker:
             )
             self.engagement_ema = 0.9 * self.engagement_ema + 0.1 * engagement_raw
             self.last_seen = now
+            
+            # Map center to -1.0 .. 1.0 range
+            if bbox:
+                # Mirror X for self-view intuitive movement (if user moves right, they appear right)
+                # Actually, standard mirror: user moves right -> image moves left. 
+                # If we want Zeni to look at the user:
+                # User is on the right of screen (screen x > width/2) -> Zeni should look RIGHT.
+                # In mirrored self-view, if I lean right, my face is on the RIGHT side of the image.
+                # So we want normalized_x > 0.
+                norm_x = (cx - self.frame_width * 0.5) / (self.frame_width * 0.5)
+                norm_y = (cy - self.frame_height * 0.5) / (self.frame_height * 0.5)
+                self.user_position = (norm_x, norm_y)
+                self.face_size = face_size
+            else:
+                # Decay to center if lost
+                self.user_position = (
+                    self.user_position[0] * 0.9,
+                    self.user_position[1] * 0.9
+                )
+                self.face_size *= 0.9
 
             time.sleep(self.frame_interval)
 
@@ -3434,6 +3599,19 @@ def main():
         ind_rect = indicator.get_rect(topright=(WIDTH - 16, 12))
         pygame.draw.circle(screen, indicator_color, (ind_rect.left - 10, ind_rect.centery), 6)
         screen.blit(indicator, ind_rect)
+        
+        # VAD indicator
+        vad_text = "VAD ON" if recorder.vad_enabled else "VAD OFF"
+        vad_color = (90, 220, 140) if recorder.vad_enabled else (180, 80, 80)
+        if recorder.recording:
+            vad_color = (255, 100, 100)
+            vad_text = "REC"
+        
+        vad_ind = SMALL_FONT.render(vad_text, True, vad_color)
+        vad_rect = vad_ind.get_rect(topright=(WIDTH - 16, 36))
+        pygame.draw.circle(screen, vad_color, (vad_rect.left - 10, vad_rect.centery), 6)
+        screen.blit(vad_ind, vad_rect)
+        screen.blit(indicator, ind_rect)
 
         pygame.display.flip()
         return face.signal_active
@@ -3784,11 +3962,10 @@ def main():
                         else:
                             status_text = "No recording to play"
                 elif event.key == pygame.K_v:
-                    if vision:
-                        print("Vision debug:", vision.debug_snapshot())
-                        status_text = "Vision stats printed"
-                    else:
-                        status_text = "Vision disabled"
+                    recorder.vad_enabled = not recorder.vad_enabled
+                    state = "ENABLED" if recorder.vad_enabled else "DISABLED"
+                    status_text = f"Hands-free voice {state}"
+                    print(f"VAD {state}")
                 elif event.key == pygame.K_LEFTBRACKET and passive:
                     passive.set_sensitivity(passive.sensitivity * 0.85)
                     status_text = f"Passive sensitivity {passive.sensitivity:.2f}x"
@@ -3847,6 +4024,12 @@ def main():
         gaze_events, gaze_state = (vision.poll() if vision else ([], {}))
         if gaze_state:
             current_gaze_state = gaze_state
+            face.update_tracking(
+                gaze_state.get("user_position"),
+                face_size=gaze_state.get("face_size", 0.0)
+            )
+        else:
+            face.update_tracking(None)
         for evt in gaze_events:
             etype = evt.get("type")
             if etype == "eye_contact":
@@ -3871,8 +4054,9 @@ def main():
                 elif not recorder.recording and not face.talking and not pygame.mixer.music.get_busy():
                     face.preview_expression("happy", duration=0.9)
             elif etype == "look_away":
-                if is_actively_speaking():
-                    interrupt_for_lookaway()
+                 # User requested to only interrupt if face is LOST, not just look away.
+                 # So we ignore look_away event for interruption.
+                 pass
             elif etype == "stare":
                 face.respond_to_stare()
             elif etype == "blink":
@@ -3987,8 +4171,9 @@ def main():
                 name_prompted = False
                 pending_request = None
 
-        if vision and is_actively_speaking() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active and not scene_playback_active:
-            interrupt_for_lookaway()
+        if vision and is_actively_speaking() and not face_recent and not lookaway_prompt_active and not scene_playback_active:
+             # If face is lost while speaking -> interrupt
+             interrupt_for_lookaway()
 
         if not passive and gaze_state:
             engagement = gaze_state.get("engagement")
