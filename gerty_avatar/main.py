@@ -2915,6 +2915,7 @@ def main():
     name_last_seen = 0.0
     expecting_name = False
     name_prompted = False
+    pending_request = None
     try:
         face_scan_interval = float(os.getenv("FACE_SCAN_INTERVAL", str(DEFAULT_FACE_SCAN_INTERVAL)))
     except ValueError:
@@ -3259,7 +3260,7 @@ def main():
         nonlocal lookaway_interrupt
         nonlocal turn_abort
         nonlocal pending_scene_request
-        nonlocal user_name, name_last_seen, expecting_name, name_prompted
+        nonlocal user_name, name_last_seen, expecting_name, name_prompted, pending_request
         try:
             turn_abort.clear()
             lookaway_interrupt = False
@@ -3290,6 +3291,8 @@ def main():
                 face.set_expression("neutral")
                 return
 
+            name_forced_mention = False
+
             if expecting_name:
                 raw = transcript.strip()
                 words = [w.strip(",.!?;:") for w in raw.split() if w.strip(",.!?;:")]
@@ -3312,15 +3315,22 @@ def main():
                 face.set_expression("neutral")
                 status_text = DEFAULT_STATUS
                 mark_activity()
-                return
+                if pending_request:
+                    transcript = pending_request.get("transcript", "")
+                    voice_mood = pending_request.get("voice_mood")
+                    pending_request = None
+                    name_forced_mention = True
+                else:
+                    return
 
             if user_name is None and not expecting_name and not name_prompted:
                 name_prompted = True
                 expecting_name = True
+                pending_request = {"transcript": transcript, "voice_mood": voice_mood}
                 status_text = "What's your name?"
                 face.set_expression("curious")
                 face.set_talking(True)
-                speak_text("Before I answer...what should I call you? What is your name?")
+                speak_text("Before I answer...what do the humans call you?")
                 while pygame.mixer.music.get_busy() and running:
                     time.sleep(0.05)
                 face.set_talking(False)
@@ -3355,9 +3365,9 @@ def main():
 
             status_text = "Thinking"
             face.set_expression("thinking")
-            mention_name = False
+            mention_name = name_forced_mention
             if user_name and (time.time() - name_last_seen) < NAME_FORGET_TIMEOUT:
-                if random.random() < 0.25:
+                if name_forced_mention or random.random() < 0.25:
                     mention_name = True
                     name_last_seen = time.time()
 
@@ -3747,6 +3757,7 @@ def main():
             if (time.time() - name_last_seen) > NAME_FORGET_TIMEOUT:
                 user_name = None
                 name_prompted = False
+                pending_request = None
 
         if vision and is_actively_speaking() and not gaze_state.get("eye_contact", True) and not lookaway_prompt_active and not scene_playback_active:
             interrupt_for_lookaway()
