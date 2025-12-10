@@ -699,7 +699,8 @@ class Face:
         # Exaggerate motion:
         # User is at -1..1. Screen width 640.
         # Let's allow head to move +/- 180 pixels.
-        scale_x = 180.0
+        # INVERT scale_x so Zeni moves opposite to user (following feeling)
+        scale_x = -180.0
         scale_y = 90.0
         self.tracking_target = [target_pos[0] * scale_x, target_pos[1] * scale_y]
         
