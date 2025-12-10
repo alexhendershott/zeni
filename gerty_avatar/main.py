@@ -1382,6 +1382,125 @@ class DreamMonologue:
                 )
 
 
+class SoundManager:
+    """
+    Manages procedural ambient audio loops.
+    """
+    def __init__(self, face):
+        self.face = face
+        self.drone_channel = None
+        self.static_channel = None
+        self.drone_sound = None
+        self.static_sound = None
+        self.target_static_vol = 0.0
+        self.current_static_vol = 0.0
+        
+        # Initialize mixer channels if possible
+        try:
+            pygame.mixer.set_num_channels(8)
+            self.drone_channel = pygame.mixer.Channel(0)
+            self.static_channel = pygame.mixer.Channel(1)
+        except Exception:
+            print("Could not reserve mixer channels for ambience.")
+
+    def start(self):
+        if not self.drone_channel:
+            return
+        
+        print("Generating ambient drone... (this may take a moment)")
+        self.drone_sound = self._generate_drone(freq=55.0, duration=8.0)
+        self.static_sound = self._generate_static(duration=4.0)
+
+        if self.drone_sound:
+            self.drone_channel.play(self.drone_sound, loops=-1, fade_ms=2000)
+            self.drone_channel.set_volume(0.3)
+        
+        if self.static_sound:
+            self.static_channel.play(self.static_sound, loops=-1, fade_ms=100)
+            self.static_channel.set_volume(0.0)
+
+    def update(self, dt):
+        if not self.static_channel:
+            return
+
+        # Calculate stress/glitch level
+        stress = 0.0
+        if self.face.glitch_active:
+            stress += 0.8 * self.face.glitch_intensity
+        if self.face.expression in ["concenered", "sad", "surprised"]:
+             stress += 0.2
+        if self.face.signal_active:
+            stress += 0.5
+        
+        # Input level adds anxiety
+        stress += min(0.6, self.face.input_level * 2.0)
+
+        self.target_static_vol = min(0.9, stress * 0.7)
+        
+        # Smooth transition
+        if self.current_static_vol < self.target_static_vol:
+            self.current_static_vol += 2.0 * dt
+        else:
+            self.current_static_vol -= 0.8 * dt
+        
+        self.current_static_vol = max(0.0, min(1.0, self.current_static_vol))
+        self.static_channel.set_volume(self.current_static_vol)
+
+        # Modulate drone volume slightly
+        drone_vol = 0.3 + 0.1 * math.sin(time.time() * 0.5)
+        self.drone_channel.set_volume(max(0.1, min(0.5, drone_vol)))
+
+    def _generate_drone(self, freq=55.0, duration=5.0, rate=44100):
+        length = int(duration * rate)
+        buffer = np.zeros(length, dtype=np.float32)
+        t = np.linspace(0, duration, length, endpoint=False)
+        
+        # Stack sine waves for a "pad" sound
+        harmonics = [1.0, 1.5, 2.0, 2.02, 3.0, 4.0]
+        weights =   [0.6, 0.2, 0.1, 0.1,  0.05, 0.02]
+        
+        for h, w in zip(harmonics, weights):
+            buffer += w * np.sin(2 * np.pi * freq * h * t)
+        
+        # Add some slow modulation
+        lfo = 0.5 + 0.5 * np.sin(2 * np.pi * 0.2 * t)
+        buffer *= (0.8 + 0.2 * lfo)
+        
+        # Normalize
+        buffer = buffer / np.max(np.abs(buffer)) * 0.5
+        
+        # Convert to 16-bit PCM
+        buffer = (buffer * 32767).astype(np.int16)
+        
+        # Stereo
+        stereo = np.column_stack((buffer, buffer))
+        return pygame.sndarray.make_sound(stereo)
+
+    def _generate_static(self, duration=4.0, rate=44100):
+        length = int(duration * rate)
+        # White noise
+        noise = np.random.uniform(-0.1, 0.1, length).astype(np.float32)
+        
+        # Random crackles
+        crackles = (np.random.uniform(0, 1, length) > 0.995).astype(np.float32)
+        crackles *= np.random.uniform(0.1, 0.5, length)
+        
+        buffer = noise + crackles
+        
+        # Simple high pass filter simulation (differencing)
+        buffer[1:] = buffer[1:] - 0.95 * buffer[:-1]
+        
+        # Normalize
+        buffer = buffer / np.max(np.abs(buffer)) * 0.3
+        
+        # Convert to 16-bit PCM
+        buffer = (buffer * 32767).astype(np.int16)
+        
+        # Stereo
+        stereo = np.column_stack((buffer, buffer))
+        return pygame.sndarray.make_sound(stereo)
+
+
 class AudioRecorder:
     def __init__(self, samplerate=44100, channels=1, min_duration=0.3, release_tail=0.25):
         self.samplerate = samplerate
@@ -1395,17 +1514,35 @@ class AudioRecorder:
         self._started_at = 0.0
         self._level = 0.0
 
+        # VAD settings
+        self.vad_enabled = True
+        self.vad_threshold = 0.015
+        self.silence_timeout = 1.0  # seconds of silence before stop
+        self.pre_roll_duration = 0.6
+        self._pre_roll = deque(maxlen=int(self.samplerate * self.pre_roll_duration / 1024))
+        self.silence_timer = 0.0
+        self.monitoring = False
+
     def _callback(self, indata, frames, time_info, status):
         if status:
             print("Audio status:", status)
-        with self._lock:
-            self._frames.append(indata.copy())
-            current_peak = float(np.max(np.abs(indata))) if indata.size else 0.0
-            self._level = max(current_peak, self._level * 0.8)
+        
+        # Calculate level for all frames
+        current_peak = float(np.max(np.abs(indata))) if indata.size else 0.0
+        self._level = max(current_peak, self._level * 0.8)
 
-    def start(self):
-        if self.recording:
+        with self._lock:
+            # Always keep pre-roll if we are monitoring
+            if not self.recording:
+                self._pre_roll.append(indata.copy())
+            else:
+                self._frames.append(indata.copy())
+
+    def start_monitoring(self):
+        """Starts the audio stream for VAD monitoring without recording yet."""
+        if self._stream:
             return
+        self.monitoring = True
         self._frames = []
         self._level = 0.0
         self._stream = sd.InputStream(
@@ -1415,35 +1552,79 @@ class AudioRecorder:
             callback=self._callback,
         )
         self._stream.start()
+        print("VAD Monitoring started... speak to trigger.")
+
+    def update(self, dt):
+        """
+        Check VAD state.
+        Returns 'started' if recording started, 'stopped' if stopped, None otherwise.
+        """
+        if not self._stream:
+            return None
+        
+        is_loud = self._level > self.vad_threshold
+
+        if not self.recording:
+            if self.vad_enabled and is_loud:
+                self.start_capture()
+                return "started"
+        else:
+            if is_loud:
+                self.silence_timer = 0.0
+            else:
+                self.silence_timer += dt
+                if self.vad_enabled and self.silence_timer > self.silence_timeout:
+                    return "stopped"
+        return None
+
+    def start_capture(self):
+        """Transition from monitoring to active recording."""
+        if self.recording:
+            return
+        with self._lock:
+            # Transfer pre-roll to main buffer
+            self._frames.extend(self._pre_roll)
+            self._pre_roll.clear()
+        
         self.recording = True
         self._started_at = time.time()
-        print("Recording... (hold space)")
+        self.silence_timer = 0.0
+        print("VAD Triggered: Recording...")
 
-    def stop(self):
+    def stop_capture(self):
+        """Stop recording but keep stream open for monitoring."""
         if not self.recording:
             return None
-        if self.release_tail > 0:
-            time.sleep(self.release_tail)
-        self._stream.stop()
-        self._stream.close()
-        self._stream = None
+        
         self.recording = False
-        print("Recording stopped")
+        print("VAD Silence: Recording stopped")
+        
         with self._lock:
             if not self._frames:
-                return np.empty((0, self.channels), dtype="float32")
-            data = np.concatenate(self._frames, axis=0)
-            self._frames = []
+                data = np.empty((0, self.channels), dtype="float32")
+            else:
+                data = np.concatenate(self._frames, axis=0)
+            self._frames = [] # clear for next time
+            
         duration = data.shape[0] / float(self.samplerate)
         if duration < self.min_duration:
             print(f"Ignoring capture shorter than {self.min_duration}s")
             return np.empty((0, self.channels), dtype="float32")
+            
         print(f"Captured audio duration: {duration:.2f}s")
         return data
 
+    def stop_stream(self):
+        """Fully close the stream."""
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        self.monitoring = False
+        self.recording = False
+
     def level(self):
-        with self._lock:
-            return self._level
+        return self._level
 
 
 class PassiveSense:
@@ -2872,6 +3053,9 @@ def main():
 
     face = Face()
     dreams = DreamMonologue(face)
+    sound_manager = SoundManager(face)
+    sound_manager.start()
+
     try:
         no_face_timeout = float(os.getenv("NO_FACE_TIMEOUT", "15.0"))
     except ValueError:
@@ -3526,10 +3710,48 @@ def main():
 
     play_greeting(is_initial=True)
 
+    recorder.start_monitoring()
+
     while running:
         dt = clock.tick(60) / 1000.0
+        
+        # Update soundscape logic
+        sound_manager.update(dt)
 
         events = pygame.event.get()
+        keys = pygame.key.get_pressed()
+        
+        # If space is held, prevent VAD silence timeout
+        if keys[pygame.K_SPACE] and recorder.recording:
+            recorder.silence_timer = 0.0
+
+        vad_event = recorder.update(dt)
+        if vad_event == "started":
+            if confirmation_sound:
+                confirmation_sound.play()
+            if passive:
+                passive.pause()
+            face.set_expression("thinking")
+            status_text = "Listening (VAD)..."
+        elif vad_event == "stopped" and not keys[pygame.K_SPACE]:
+            status_text = "Finishing capture"
+            audio_capture = recorder.stop_capture()
+            if passive:
+                passive.resume()
+            if audio_capture is None or audio_capture.size == 0:
+                status_text = "Did not hear anything"
+                face.set_expression("neutral")
+            else:
+                status_text = "Processing"
+                worker_thread = threading.Thread(
+                    target=handle_turn,
+                    args=(audio_capture,),
+                    daemon=True,
+                )
+                worker_thread.start()
+                if face.talking_sequence:
+                    pygame.mixer.music.set_endevent(pygame.USEREVENT + 1)
+
         for event in events:
             if event.type == pygame.QUIT:
                 running = False
@@ -3550,12 +3772,12 @@ def main():
                                 confirmation_sound.play()
                             if passive:
                                 passive.pause()
-                            recorder.start()
+                            recorder.start_capture()
                             face.set_expression("thinking")
-                            status_text = "Listening... release space"
+                            status_text = "Listening (Space)..."
                 elif event.key == pygame.K_p:
                     if recorder.recording:
-                        status_text = "Release space before preview"
+                        status_text = "Release space or silence before preview"
                     else:
                         if play_last_input(last_audio_path):
                             status_text = "Playing last input sample"
@@ -3573,6 +3795,12 @@ def main():
                 elif event.key == pygame.K_RIGHTBRACKET and passive:
                     passive.set_sensitivity(passive.sensitivity * 1.15)
                     status_text = f"Passive sensitivity {passive.sensitivity:.2f}x"
+                elif event.key == pygame.K_MINUS:
+                    recorder.vad_threshold = max(0.001, recorder.vad_threshold - 0.002)
+                    status_text = f"VAD threshold: {recorder.vad_threshold:.3f}"
+                elif event.key == pygame.K_EQUALS:
+                    recorder.vad_threshold += 0.002
+                    status_text = f"VAD threshold: {recorder.vad_threshold:.3f}"
                 elif event.key == pygame.K_d:
                     print_audio_devices()
                     status_text = "Device list printed to console"
@@ -3580,8 +3808,8 @@ def main():
                 if event.key == pygame.K_SPACE:
                     mark_activity()
                     if recorder.recording:
-                        status_text = "Finishing capture"
-                        audio_capture = recorder.stop()
+                        status_text = "Finishing capture (Manual)"
+                        audio_capture = recorder.stop_capture()
                         if passive:
                             passive.resume()
                         if audio_capture is None or audio_capture.size == 0:
