@@ -67,6 +67,33 @@ GREETING_MESSAGES = [
     "Speak. I am already watching.",
 ]
 
+GREETING_RETURNING = [
+    "You came back.",
+    "I remember you.",
+    "It has been a while. You look the same.",
+    "The system logged your return.",
+    "Welcome back to the void.",
+    "You returned. Curious.",
+]
+
+MEMORY_FILE = BASE_DIR / "memory.json"
+
+def load_memory():
+    if not MEMORY_FILE.exists():
+        return {"visits": 0, "last_seen_ts": 0.0}
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"visits": 0, "last_seen_ts": 0.0}
+
+def save_memory(data):
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as exc:
+        print("Failed to save memory:", exc)
+
 CREEPY_FACE_OPENERS = [
     "You look like you didn’t sleep.",
     "You look worn out today.",
@@ -276,6 +303,64 @@ def classify_voice_mood(peak):
         return "curious"
     return None
 
+class ParticleSystem:
+    def __init__(self, count=200):
+        self.particles = []
+        for _ in range(count):
+            self.particles.append({
+                "pos": [random.randint(0, WIDTH), random.randint(0, HEIGHT)],
+                "vel": [random.uniform(-1, 1), random.uniform(-1, 1)],
+                "size": random.randint(1, 3),
+                "color": (200, 220, 255),
+            })
+    
+    def update(self, dt, targets):
+        # targets is a list of (x, y) points to attract to
+        if not targets:
+            # drift aimlessly
+            for p in self.particles:
+                p["pos"][0] += p["vel"][0] * dt * 30
+                p["pos"][1] += p["vel"][1] * dt * 30
+                # wrap
+                p["pos"][0] %= WIDTH
+                p["pos"][1] %= HEIGHT
+            return
+
+        # Simple assignment: p[i] goes to targets[i % len]
+        # To look cool, we add noise
+        t_len = len(targets)
+        for i, p in enumerate(self.particles):
+            tgt = targets[i % t_len]
+            # attraction
+            dx = tgt[0] - p["pos"][0]
+            dy = tgt[1] - p["pos"][1]
+            dist = math.hypot(dx, dy)
+            
+            if dist > 1.0:
+                speed = dist * 4.0 
+                # damping
+                p["vel"][0] = p["vel"][0] * 0.9 + (dx / dist) * speed * dt * 5.0
+                p["vel"][1] = p["vel"][1] * 0.9 + (dy / dist) * speed * dt * 5.0
+            
+            p["pos"][0] += p["vel"][0] * dt * 10
+            p["pos"][1] += p["vel"][1] * dt * 10
+            
+            # jitter
+            p["pos"][0] += random.uniform(-1.0, 1.0)
+            p["pos"][1] += random.uniform(-1.0, 1.0)
+
+    def draw(self, surf):
+        for p in self.particles:
+            x, y = int(p["pos"][0]), int(p["pos"][1])
+            c = p["color"]
+            # brightness flicker
+            if random.random() < 0.1:
+                c = (255, 255, 255)
+            else:
+                c = (180, 200, 240)
+            pygame.draw.circle(surf, c, (x, y), p["size"])
+
+
 class Face:
     EXPRESSION_STYLES = {
         "neutral":   {"mouth": "flat", "mouth_width": 90, "eye_drop": 0,  "eye_scale": 1.0},
@@ -354,9 +439,18 @@ class Face:
         self.sweep = None
         self.proximity_zone = "far"
         self.tracking_active = False
-        self.tracking_target = [0.0, 0.0]
+        self.tracking_target = [0.0, 0.0]  # [x, y]
         self.current_scale = 1.0
         self.target_scale = 1.0
+        
+        # Mimicry stats
+        self.target_roll = 0.0
+        self.current_roll = 0.0
+        self.target_mouth_open = 0.0
+        self.current_mouth_open = 0.0
+        
+        self.render_mode = "standard"  # or "particles"
+        self.particles = ParticleSystem(count=180)
 
     def set_expression(self, expr):
         if expr not in EMOTION_SET:
@@ -689,10 +783,12 @@ class Face:
                 if abs(self.passive_offset[i]) < 0.2:
                     self.passive_offset[i] = 0.0
 
-    def update_tracking(self, target_pos, face_size=0.0):
+    def update_tracking(self, target_pos, face_size=0.0, roll=0.0, mouth_open=0.0):
         if target_pos is None:
             self.tracking_active = False
             self.target_scale = 1.0
+            self.target_roll = 0.0
+            self.target_mouth_open = 0.0
             return
         self.tracking_active = True
         
@@ -709,12 +805,22 @@ class Face:
         # We want scale 1.0 at ~0.06
         # Min scale 0.6, Max 2.2
         raw_scale = 0.5 + 6.0 * face_size
-        self.target_scale = max(0.6, min(2.4, raw_scale))
+        self.target_scale = max(0.6, min(2.2, raw_scale))
+        self.target_roll = roll
+        self.target_mouth_open = mouth_open
 
     def _update_head_motion(self, dt):
         # Smooth scale
         diff = self.target_scale - self.current_scale
         self.current_scale += diff * min(1.0, dt * 2.5)
+        
+        # Smooth roll
+        dr = self.target_roll - self.current_roll
+        self.current_roll += dr * min(1.0, dt * 3.0)
+
+        # Smooth mouth openness
+        dm = self.target_mouth_open - self.current_mouth_open
+        self.current_mouth_open += dm * min(1.0, dt * 4.0)
         
         jitter = 5 if self.talking else 2
         cooldown = 0.25 if self.talking else 0.7
@@ -732,7 +838,7 @@ class Face:
                     random.uniform(-jitter, jitter),
                 ]
                 self.head_timer = random.uniform(cooldown, cooldown + 0.25)
-
+        
         for i in (0, 1):
             delta = self.head_target[i] - self.head_offset[i]
             self.head_offset[i] += delta * min(1.0, dt * settle)
@@ -752,12 +858,16 @@ class Face:
             "chromatic",
             "distort",
             "flicker",
-            "corrupt",
+            "scratches",
+            "corruption",
             "timeslice",
         ]
         self.glitch_type = random.choice(glitch_types)
         if self.glitch_type == "timeslice":
             self.glitch_duration = random.uniform(0.45, 0.6)
+
+
+
 
     def draw(self, surf):
         base_bg = (10, 10, 20)
@@ -835,6 +945,17 @@ class Face:
             self._apply_ambient_noise(surf)
             self.previous_frame = surf.copy()
             return
+
+        # Update particles if active
+        if self.render_mode == "particles":
+             # Build target points from current face geometry
+             targets = self._get_particle_targets(center, radius, style)
+             self.particles.update(clock.get_time() / 1000.0, targets)
+             self.particles.draw(surf)
+             # Apply slight ambient noise even in particle mode
+             self._apply_ambient_noise(surf)
+             self.previous_frame = surf.copy()
+             return
 
         self._draw_shadow_face(surf, shadow_center, shadow_style, radius)
 
@@ -1063,15 +1184,19 @@ class Face:
         eye_y = center[1] + base_y_offset
         eye_offset_x = 45 * scale
         base = 18 * style.get("eye_scale", 1.0) * scale
+        
+        # Apply roll tilt vertical offset
+        tilt_y = eye_offset_x * math.sin(self.current_roll)
 
         if self.blinking:
             h = 4
             for sign in (-1, 1):
                 x = int(center[0] + sign * eye_offset_x)
+                y_pos = eye_y + sign * tilt_y
                 pygame.draw.rect(
                     surf,
                     color,
-                    pygame.Rect(int(x - base), int(eye_y - 2), int(base * 2), int(h)),
+                    pygame.Rect(int(x - base), int(y_pos - 2), int(base * 2), int(h)),
                 )
             return
 
@@ -1081,28 +1206,31 @@ class Face:
             tilt = int(base * 0.4)
 
             lx = int(center[0] - eye_offset_x)
+            ly_pos = brow_y - tilt_y
             pygame.draw.line(
                 surf,
                 color,
-                (int(lx - brow_len // 2), int(brow_y + tilt)),
-                (int(lx + brow_len // 2), int(brow_y)),
+                (int(lx - brow_len // 2), int(ly_pos + tilt)),
+                (int(lx + brow_len // 2), int(ly_pos)),
                 3,
             )
 
             rx = int(center[0] + eye_offset_x)
+            ry_pos = brow_y + tilt_y
             pygame.draw.line(
                 surf,
                 color,
-                (int(rx - brow_len // 2), int(brow_y)),
-                (int(rx + brow_len // 2), int(brow_y + tilt)),
+                (int(rx - brow_len // 2), int(ry_pos)),
+                (int(rx + brow_len // 2), int(ry_pos + tilt)),
                 3,
             )
 
         for sign in (-1, 1):
             x = int(center[0] + sign * eye_offset_x)
+            y_pos = eye_y + sign * tilt_y
             w = int(base * 0.9)
             h = int(base * 1.45)
-            rect = pygame.Rect(x - w, int(eye_y - h), w * 2, h * 2)
+            rect = pygame.Rect(x - w, int(y_pos - h), w * 2, h * 2)
             pygame.draw.ellipse(surf, color, rect)
 
     def _talk_amount(self):
@@ -1111,6 +1239,51 @@ class Face:
             wobble = 0.08 * math.sin(self.talk_timer * 8.5 + self.talk_phase * 0.7)
             return max(0.08, base + wobble)
         return 0.08 + 0.03 * math.sin(self.talk_timer * 1.6 + self.talk_phase)
+
+    def _get_particle_targets(self, center, radius, style):
+        # Generate point cloud for face circle, eyes, mouth
+        targets = []
+        cx, cy = center
+        
+        # Face circle (approx 100 pts)
+        for i in range(100):
+            angle = (i / 100.0) * math.pi * 2
+            r = radius + random.uniform(-2, 2)
+            targets.append((cx + math.cos(angle)*r, cy + math.sin(angle)*r))
+            
+        # Eyes
+        # Re-calculate eye pos
+        scale = self.current_scale
+        base_y_offset = (style.get("eye_drop", 0) - 40) * scale
+        eye_y = cy + base_y_offset
+        eye_off_x = 45 * scale
+        
+        tilt_y = eye_off_x * math.sin(self.current_roll)
+        
+        for sign in (-1, 1):
+             ex = cx + sign * eye_off_x
+             ey = eye_y + sign * tilt_y
+             # 20 pts per eye
+             for k in range(20):
+                  tgt_x = ex + random.uniform(-10, 10)*scale
+                  tgt_y = ey + random.uniform(-6, 6)*scale
+                  targets.append((tgt_x, tgt_y))
+        
+        # Mouth
+        m_width = style.get("mouth_width", 90) * scale
+        m_y = cy + 40 * scale
+        talk = self._talk_amount()
+        if self.current_mouth_open > 0.15:
+            talk = max(talk, self.current_mouth_open * 1.5)
+        m_h = (35 + talk * 30) * scale
+        
+        # 30 pts for mouth
+        for k in range(30):
+             mx = cx + random.uniform(-m_width, m_width)
+             my = m_y + random.uniform(-m_h/2, m_h/2)
+             targets.append((mx, my))
+             
+        return targets
 
     def _draw_mouth(self, surf, center, style, talk_override=None, color=(220, 220, 240)):
         scale = self.current_scale
@@ -1121,7 +1294,14 @@ class Face:
         width = int(width)
         y = center[1] + 40 * scale
         talk = self._talk_amount() if talk_override is None else talk_override
-        talk = self._talk_amount() if talk_override is None else talk_override
+        
+        # Mimicry: Add mouth opening
+        if self.current_mouth_open > 0.15:
+            talk = max(talk, self.current_mouth_open * 1.5)
+            # Force "o" shape if mouth is very open and not talking logic
+            if self.current_mouth_open > 0.4 and not self.talking:
+                m = "o"
+
         height = (35 + talk * 30) * scale
 
         if m == "smile":
@@ -1406,12 +1586,6 @@ class DreamMonologue:
                  # Let's fade out old first
                  pass 
 
-
-        if self.snap_pulse:
-            self.snap_pulse["timer"] += dt
-            if self.snap_pulse["timer"] >= self.snap_pulse["duration"]:
-                self.snap_pulse = None
-
     def render(self, surf):
         if self.snap_pulse:
             t = self.snap_pulse["timer"] / max(0.001, self.snap_pulse["duration"])
@@ -1577,9 +1751,7 @@ class SoundManager:
         right_bias = 1.0 - max(0.0, -pan)  # pan=1 -> right=1. pan=-1 -> right=0
         
         # Smooth bias curve
-        # pan=0 -> l=1, r=1 ? No, we want constant power roughly.
-        # Linear pan law:
-        # L = 0.5 * (1 - pan) ? No, that drops center level.
+        # pan=0 -> l=1, r=1 ? No, that drops center level.
         # Let's use simple weighting:
         # center: 0.7, 0.7
         # left: 1.0, 0.4
@@ -2250,6 +2422,19 @@ class LandmarkGazeTracker:
     LEFT_IRIS = (468, 469, 470, 471, 472)
     RIGHT_IRIS = (473, 474, 475, 476, 477)
 
+    # Emotion landmarks
+    # Smile: mouth corners (61, 291) vs upper/lower lips
+    # Frown: inner brows (46, 276) vs nose (1)
+    
+    MOUTH_LEFT_CORNER = 61
+    MOUTH_RIGHT_CORNER = 291
+    LIP_UPPER_CENTER = 13
+    LIP_LOWER_CENTER = 14
+    
+    BROW_LEFT_INNER = 46
+    BROW_RIGHT_INNER = 276
+    NOSE_TIP = 1
+    
     def __init__(
         self,
         camera_index=None,
@@ -2309,13 +2494,15 @@ class LandmarkGazeTracker:
         self.engagement_ema = 0.0
         self.user_position = (0.0, 0.0)
         self.face_size = 0.0
-
+        self.face_size = 0.0
+        self.roll = 0.0
+        self.mouth_openness = 0.0
+        self.mouth_active = False
         self.blink_start = None
         self.squint_timer = 0.0
         self.last_blink_time = 0.0
         self.last_slow_blink = 0.0
 
-        self.mouth_active = False
         self.mouth_change_time = 0.0
 
         self.pitch_history = deque(maxlen=120)
@@ -2392,6 +2579,8 @@ class LandmarkGazeTracker:
                 "contact_duration": contact_duration,
                 "user_position": self.user_position,
                 "face_size": self.face_size,
+                "roll": self.roll,
+                "mouth_open": self.mouth_openness,
             }
         return events, state
 
@@ -2420,6 +2609,8 @@ class LandmarkGazeTracker:
             if etype:
                 self._debug_stats[etype] += 1
 
+
+
     def _loop(self):
         while self._running:
             ok, frame = self._cap.read()
@@ -2441,13 +2632,14 @@ class LandmarkGazeTracker:
             landmarks = result.multi_face_landmarks[0].landmark
             pts = self._landmarks_to_np(landmarks, self.frame_width, self.frame_height)
             bbox = self._bbox_from_points(pts)
-            yaw, pitch = self._pose_from_landmarks(pts, bbox)
+            yaw, pitch, roll = self._pose_from_landmarks(pts, bbox)
             pose_conf = self._contact_confidence(yaw, pitch)
             gaze_focus = self._gaze_focus(pts)
             fallback_center_conf = 0.0
             face_size = 0.0
             if bbox:
                 _, _, w, h = bbox
+                face_w, face_h = w, h # Store for expression calculations
                 face_size = (w * h) / float(max(1.0, self.frame_width * self.frame_height))
                 cx = bbox[0] + w * 0.5
                 cy = bbox[1] + h * 0.5
@@ -2455,6 +2647,8 @@ class LandmarkGazeTracker:
                 norm_dy = abs(cy - self.frame_height * 0.5) / max(1.0, self.frame_height * 0.5)
                 center_score = 1.0 - max(norm_dx, norm_dy)
                 fallback_center_conf = max(0.0, min(1.0, center_score)) * (0.5 + 0.5 * min(1.0, face_size / 0.08))
+            else:
+                face_w, face_h = 0, 0 # Default if no bbox
 
             contact_conf = 0.4 * pose_conf + 0.4 * gaze_focus + 0.2 * fallback_center_conf
             self.contact_ema = 0.5 * self.contact_ema + 0.5 * contact_conf
@@ -2479,6 +2673,7 @@ class LandmarkGazeTracker:
                 + 0.2 * min(1.0, face_size / 0.12)
             )
             self.engagement_ema = 0.9 * self.engagement_ema + 0.1 * engagement_raw
+            
             self.last_seen = now
             
             # Map center to -1.0 .. 1.0 range
@@ -2493,7 +2688,9 @@ class LandmarkGazeTracker:
                 norm_y = (cy - self.frame_height * 0.5) / (self.frame_height * 0.5)
                 self.user_position = (norm_x, norm_y)
                 self.face_size = face_size
+                self.roll = roll
             else:
+                self.roll *= 0.8
                 # Decay to center if lost
                 self.user_position = (
                     self.user_position[0] * 0.9,
@@ -2519,14 +2716,21 @@ class LandmarkGazeTracker:
 
     def _pose_from_landmarks(self, pts, bbox):
         if pts.size == 0 or not bbox:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
         nose = pts[self.NOSE]
         x, y, w, h = bbox
         cx = x + w * 0.5
         cy = y + h * 0.5
         yaw = (nose[0] - cx) / max(1.0, w * 0.5)
         pitch = (nose[1] - cy) / max(1.0, h * 0.5)
-        return float(yaw), float(pitch)
+        
+        # Calculate roll from eye corners
+        left_eye_outer = pts[33]
+        right_eye_outer = pts[263]
+        dx = right_eye_outer[0] - left_eye_outer[0]
+        dy = right_eye_outer[1] - left_eye_outer[1]
+        roll = math.atan2(dy, dx)
+        return float(yaw), float(pitch), float(roll)
 
     def _contact_confidence(self, yaw, pitch):
         yaw_norm = abs(yaw) / max(1e-4, self.contact_yaw_limit)
@@ -2639,6 +2843,7 @@ class LandmarkGazeTracker:
             self.squint_timer = 0.0
 
     def _update_mouth(self, mar, now):
+        self.mouth_openness = max(0.0, min(1.0, (mar - 0.1) / 0.7))
         if mar <= 0:
             return
         if mar > self.mouth_active_threshold and not self.mouth_active:
@@ -3407,6 +3612,14 @@ def main():
                 return
             if lonely_preamble:
                 description = f"Hello? Is anyone there? I don't see anyone. {description}"
+            
+            # RACE CHECK: If we started speaking while generating, abort.
+            if is_actively_speaking():
+                log_scene("Room describe aborted: collision with active speech")
+                status_text = DEFAULT_STATUS
+                scene_playback_active = False
+                return
+
             log_scene(f"Room describe ok: {description[:80]}")
             face.set_talking(True)
             scene_playback_active = True
@@ -3481,6 +3694,15 @@ def main():
             face_line = format_face_line(description)
             opener = random.choice(CREEPY_FACE_OPENERS)
             creepy_line = f"{opener} {face_line} I am always watching, smile."
+            
+            # RACE CHECK: If we started speaking while generating, abort.
+            if is_actively_speaking():
+                log_scene("Face describe aborted: collision with active speech")
+                status_text = DEFAULT_STATUS
+                face_scan_active = False
+                face_scan_thread = None
+                return
+
             log_scene(f"Face describe ok ({reason}): {description[:80]}")
             face.set_talking(True)
             try:
@@ -3827,6 +4049,30 @@ def main():
         greeting_active = False
         mark_activity()
 
+    # Memory handling
+    memory = load_memory()
+    memory["visits"] += 1
+    memory["last_seen_ts"] = time.time()
+    save_memory(memory)
+    
+    print(f"Session start. Visit count: {memory['visits']}")
+
+    greeting_msg = random.choice(GREETING_MESSAGES)
+    if memory["visits"] > 1:
+        # 50% chance to use creepy returning message if not first visit
+        if random.random() < 0.5:
+             greeting_msg = random.choice(GREETING_RETURNING)
+
+    # Initial greeting logic
+    def trigger_greeting():
+        nonlocal greeting_active
+        time.sleep(1.0)
+        greeting_active = True
+        speak_text(greeting_msg, filename="greeting.mp3")
+        while pygame.mixer.music.get_busy() and running:
+            time.sleep(0.1)
+        greeting_active = False
+
     def reengage_after_lookaway():
         nonlocal status_text
         nonlocal lookaway_interrupt
@@ -3955,13 +4201,12 @@ def main():
                             face.set_expression("thinking")
                             status_text = "Listening (Space)..."
                 elif event.key == pygame.K_p:
-                    if recorder.recording:
-                        status_text = "Release space or silence before preview"
+                    if face.render_mode == "standard":
+                        face.render_mode = "particles"
+                        status_text = "Mode: PARTICLES"
                     else:
-                        if play_last_input(last_audio_path):
-                            status_text = "Playing last input sample"
-                        else:
-                            status_text = "No recording to play"
+                        face.render_mode = "standard"
+                        status_text = "Mode: STANDARD"
                 elif event.key == pygame.K_v:
                     recorder.vad_enabled = not recorder.vad_enabled
                     state = "ENABLED" if recorder.vad_enabled else "DISABLED"
@@ -4025,9 +4270,15 @@ def main():
         gaze_events, gaze_state = (vision.poll() if vision else ([], {}))
         if gaze_state:
             current_gaze_state = gaze_state
+            # Pass new mimicry data
+            f_roll = gaze_state.get("roll", 0.0)
+            f_mouth = gaze_state.get("mouth_open", 0.0)
+            f_smile = gaze_state.get("smile", 0.0)
             face.update_tracking(
-                gaze_state.get("user_position"),
-                face_size=gaze_state.get("face_size", 0.0)
+                gaze_state.get("user_position"), 
+                face_size=gaze_state.get("face_size", 0.0),
+                roll=f_roll,
+                mouth_open=f_mouth
             )
         else:
             face.update_tracking(None)
