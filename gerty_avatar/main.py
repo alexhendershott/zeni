@@ -872,7 +872,23 @@ class Face:
 
 
     def draw(self, surf):
-        base_bg = (10, 10, 20)
+        # Calculate pulse first (needed for background selection)
+        base = 28
+        pulse_speed = 3.2 if self.talking else 1.6
+        pulse = base + int(22 * (0.5 + 0.5 * math.sin(self.talk_timer * pulse_speed + self.talk_phase)))
+        pulse = max(20, min(90, pulse))
+        
+        # Breathing background: interpolate between two very dark blues at ~12–18 BPM
+        breath_rate_hz = 0.25  # ~15 BPM
+        breath = 0.5 + 0.5 * math.sin(self.noise_timer * breath_rate_hz * math.tau + self.talk_phase * 0.1)
+        breath = max(0.0, min(1.0, breath)) ** 1.4  # bias toward darker lows
+        max_bg = (24, 32, 48)  # stays dark even at peak
+        blend = breath
+        base_bg = (
+            int(max_bg[0] * blend),
+            int(max_bg[1] * blend),
+            int(max_bg[2] * blend),
+        )
 
         if self.signal_active:
             surf.fill((0, 0, 0))
@@ -895,11 +911,7 @@ class Face:
 
             return
         
-        if self.glitch_active and self.glitch_type in ["flicker", "corrupt"]:
-            flicker = int(random.random() * 30 * self.glitch_intensity)
-            surf.fill((base_bg[0] + flicker, base_bg[1] + flicker, base_bg[2] + flicker))
-        else:
-            surf.fill(base_bg)
+        surf.fill(base_bg)
         
         if self.glitch_active:
             self._apply_glitch_effects(surf)
@@ -918,14 +930,9 @@ class Face:
         )
         radius = 373 * self.current_scale
 
-        base = 28
-        pulse_speed = 3.2 if self.talking else 1.6
-        pulse = base + int(22 * (0.5 + 0.5 * math.sin(self.talk_timer * pulse_speed + self.talk_phase)))
-        pulse = max(20, min(90, pulse))
-
         if self.listening:
-            # dim base
-            surf.fill((5, 5, 10))
+            # dim base - use very low blue for B&W TV
+            surf.fill((5, 5, 4))
             # central listening core
             center = (WIDTH // 2 + int(self.head_offset[0]), HEIGHT // 2 + int(self.head_offset[1]))
             r = 40 + int(60 * min(1.0, self.input_level * 6.0))
@@ -965,16 +972,17 @@ class Face:
         face_size = int(radius * 3)  # Large enough to contain rotated face
         temp_surf = pygame.Surface((face_size, face_size), pygame.SRCALPHA)
         temp_center = (face_size // 2, face_size // 2)
+        face_val = max(90, min(170, int(pulse * 1.3)))
 
         if self.signal_active:
             distort = random.randint(-6, 6)
             distorted_radius = radius + distort
-            pygame.draw.circle(temp_surf, (pulse, pulse, pulse + 20), temp_center, max(120, distorted_radius))
+            pygame.draw.circle(temp_surf, (face_val, face_val, face_val), temp_center, max(120, distorted_radius))
             smear_width = random.randint(4, 10)
             smear = pygame.Rect(temp_center[0] - radius, temp_center[1] - smear_width // 2, radius * 2, smear_width)
-            pygame.draw.rect(temp_surf, (pulse + 20, pulse, pulse), smear, border_radius=smear_width // 2)
+            pygame.draw.rect(temp_surf, (face_val, face_val, face_val), smear, border_radius=smear_width // 2)
         else:
-            pygame.draw.circle(temp_surf, (pulse, pulse, pulse + 20), temp_center, radius)
+            pygame.draw.circle(temp_surf, (face_val, face_val, face_val), temp_center, radius)
 
         if self.glitch_active and self.glitch_type == "distort":
             distorted_center = (
@@ -1005,19 +1013,17 @@ class Face:
         layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         jitter = math.sin(self.noise_timer * 0.9 + self.talk_phase * 0.5)
         radius = int(base_radius * (0.9 + 0.05 * jitter))
-        glow_base = int(60 + 90 * self.shadow_strength)
-        glow_color = (glow_base, glow_base + 25, glow_base + 70, 140)
-        core_color = (
-            min(255, glow_base + 30),
-            min(255, glow_base + 55),
-            min(255, glow_base + 120),
-            180,
-        )
+        # Moderate brightness for face glow
+        glow_base = int(20 + 25 * self.shadow_strength)
+        glow_color = (glow_base, glow_base + 8, glow_base + 24, 160)
+        core_gray = min(190, glow_base + 35)
+        core_color = (core_gray, core_gray, core_gray, 200)
 
         pygame.draw.circle(layer, glow_color, center, radius + 12)
         pygame.draw.circle(layer, core_color, center, radius)
 
-        echo_color = (190, 210, 255)
+        echo_gray = min(200, glow_base + 60)
+        echo_color = (echo_gray, echo_gray, echo_gray)
         tone_wobble = 0.12 + 0.25 * self.shadow_strength
         talk_amount = tone_wobble + 0.08 * math.sin(self.noise_timer * 1.4 + self.talk_phase * 0.3)
         talk_amount = max(0.05, talk_amount)
@@ -1036,7 +1042,7 @@ class Face:
                 ),
             )
 
-        layer.set_alpha(int(80 + 120 * self.shadow_strength))
+        layer.set_alpha(int(120 + 120 * self.shadow_strength))
         surf.blit(layer, (0, 0))
 
     def _apply_glitch_effects(self, surf):
@@ -1068,7 +1074,7 @@ class Face:
             red_channel.fill((0, 0, 0))
             red_channel.blit(temp_surf, (shift, 0))
             red_channel.set_colorkey((0, 0, 0))
-            surf.blit(red_channel, (-shift, 0), special_flags=pygame.BLEND_RGB_ADD)
+            surf.blit(red_channel, (-shift, 0))
         
         elif self.glitch_type == "corrupt":
             num_bars = int(8 * self.glitch_intensity)
@@ -1146,7 +1152,7 @@ class Face:
             length = random.randint(20, 80)
             thickness = random.randint(1, 3)
             brightness = random.randint(100, 180)
-            color = (brightness, brightness, brightness + 20)
+            color = (brightness, brightness, brightness)  # Pure grayscale for B&W TV
             
             if edge == 'top':
                 x = random.randint(0, WIDTH - length)
@@ -1166,7 +1172,7 @@ class Face:
             for _ in range(num_dead_pixels):
                 x = random.randint(0, WIDTH)
                 y = random.randint(0, HEIGHT)
-                color = random.choice([(0, 0, 0), (255, 255, 255), (200, 100, 100)])
+                color = random.choice([(0, 0, 0), (255, 255, 255), (100, 100, 100)])  # Grayscale only
                 pygame.draw.rect(surf, color, pygame.Rect(x, y, 2, 2))
         
         if self.input_level > 0.02:
@@ -1179,19 +1185,21 @@ class Face:
                 x = int(((i + offset) / band_count) * WIDTH)
                 width = max(2, int(2 + self.input_level * 10))
                 brightness = int(120 + self.input_level * 180)
+                brightness = max(0, min(255, brightness))
                 alpha = int(80 + self.input_level * 140)
+                alpha = max(0, min(255, alpha))
                 color = (brightness, brightness, brightness, max(80, min(255, alpha)))
                 rect = pygame.Rect(x - width // 2, y, width, band_height)
                 pygame.draw.rect(band_surface, color, rect, border_radius=max(2, width // 2))
                 pygame.draw.line(
                     band_surface,
-                    (min(255, brightness + 30),) * 3 + (max(120, alpha),),
+                    (min(255, brightness + 30),) * 3 + (max(120, min(255, alpha)),),
                     (x, y),
                     (x, y + band_height),
                     1,
                 )
             band_surface.set_alpha(max(80, int(120 * mic_factor)))
-            surf.blit(band_surface, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+            surf.blit(band_surface, (0, 0))
     
     def _draw_eyes(self, surf, center, style, color=(220, 220, 240)):
         scale = self.current_scale
@@ -1611,23 +1619,23 @@ class DreamMonologue:
         if self.snap_pulse:
             t = self.snap_pulse["timer"] / max(0.001, self.snap_pulse["duration"])
             fade = max(0.0, 1.0 - t)
-            pulse_alpha = int(160 * fade)
+            pulse_alpha = int(120 * fade)
             pulse = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            tint = (80, 90, 150, pulse_alpha)
+            tint = (20, 40, 80, pulse_alpha)
             pulse.fill(tint)
             pygame.draw.rect(
                 pulse,
-                (150, 180, 255, int(pulse_alpha * 0.5)),
+                (60, 90, 140, int(pulse_alpha * 0.5)),
                 pygame.Rect(10, 10, WIDTH - 20, HEIGHT - 20),
                 2,
             )
-            surf.blit(pulse, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+            surf.blit(pulse, (0, 0))
 
         if self.current_image:
             # Draw dream image with alpha
             if self.image_alpha > 0:
-                self.current_image.set_alpha(int(self.image_alpha * 0.4)) # max 40% opacity so face is visible
-                surf.blit(self.current_image, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+                self.current_image.set_alpha(int(self.image_alpha * 0.25)) # max 25% opacity so face is visible
+                surf.blit(self.current_image, (0, 0))
 
         if not self.overlays:
             return
@@ -1640,11 +1648,11 @@ class DreamMonologue:
                 continue
 
             text = overlay["text"]
-            color = (170, 180, 210)
+            color = (140, 170, 210)
             if overlay["stage"] == "unsettling":
-                color = (190, 150, 150)
+                color = (140, 160, 190)
             elif overlay["stage"] == "abstract":
-                color = (180, 180, 230)
+                color = (150, 180, 215)
 
             raw = SMALL_FONT.render(text, True, color)
             width = raw.get_width()
@@ -1661,7 +1669,7 @@ class DreamMonologue:
                 blur = pygame.transform.smoothscale(
                     fragment, (int(slice_width * 0.9), max(1, int(raw.get_height() * 0.9)))
                 )
-                fragment.blit(blur, (random.randint(-2, 2), random.randint(-1, 1)), special_flags=pygame.BLEND_RGBA_ADD)
+                fragment.blit(blur, (random.randint(-2, 2), random.randint(-1, 1)))
 
             if random.random() < 0.5:
                 scan_x = random.randint(0, fragment.get_width() - 1)
@@ -1680,7 +1688,7 @@ class DreamMonologue:
                 int(overlay["pos"][0] + x_jitter),
                 int(overlay["pos"][1] + y_jitter),
             )
-            surf.blit(fragment, dest, special_flags=pygame.BLEND_RGBA_ADD)
+            surf.blit(fragment, dest)
 
             if random.random() < 0.35:
                 ghost = fragment.copy()
@@ -1688,7 +1696,6 @@ class DreamMonologue:
                 surf.blit(
                     ghost,
                     (dest[0] + random.randint(-6, 6), dest[1] + random.randint(-4, 4)),
-                    special_flags=pygame.BLEND_RGBA_ADD,
                 )
 
 
@@ -3774,28 +3781,12 @@ def main():
         face.listening = show_meter
         face.draw(screen)
 
-        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        tint = (0, 0, 0, 0)
-
-        if face.expression in ("happy", "excited", "curious"):
-            tint = (50, 40, 80, 40)
-        elif face.expression in ("sad", "concerned"):
-            tint = (10, 30, 80, 60)
-        elif face.expression == "confused":
-            tint = (80, 60, 20, 50)
-        elif face.expression == "surprised":
-            tint = (120, 80, 20, 70)
-        elif face.signal_active:
-            tint = (150, 30, 30, 90)
-
-        if tint[3] > 0:
-            overlay.fill(tint)
-            screen.blit(overlay, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+        # Keep background dark: expression tints disabled from the fullscreen layer.
 
         if prethought_flash:
             flicker = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            haze_alpha = max(30, prethought_flash["alpha"] // 3)
-            flicker.fill((40, 40, 90, haze_alpha))
+            haze_alpha = max(8, prethought_flash["alpha"] // 6)
+            flicker.fill((10, 10, 20, haze_alpha))
             word = prethought_flash["text"]
             jitter_x = random.randint(-2, 2)
             jitter_y = random.randint(-2, 2)
@@ -3808,10 +3799,11 @@ def main():
             )
             flicker.blit(text, text_rect)
             ghost = text.copy()
-            ghost.set_alpha(80)
+            ghost.set_alpha(40)
             flicker.blit(ghost, text_rect.move(random.randint(-3, 3), random.randint(-1, 2)))
-            flicker.set_alpha(prethought_flash["alpha"])
-            screen.blit(flicker, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+            flicker.set_alpha(max(20, prethought_flash["alpha"] // 3))
+            # Use min blend to avoid brightening the screen
+            screen.blit(flicker, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
         dreams.render(screen)
 
