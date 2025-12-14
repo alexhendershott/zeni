@@ -54,7 +54,10 @@ NAME_FORGET_TIMEOUT = 600.0
 pygame.init()
 screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 # Get actual screen dimensions after fullscreen
+# CRT optimization: Overscan compensation - keep face within safe area
+# The existing head_offset limits naturally keep content within ~5% margins
 WIDTH, HEIGHT = screen.get_size()
+screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN)
 pygame.display.set_caption("Gerty style avatar")
 clock = pygame.time.Clock()
 pygame.mixer.init()
@@ -438,7 +441,9 @@ class Face:
         self.shadow_merge_timer = random.uniform(4.5, 7.5)
         self.shadow_strength = 0.4
         self.passive_offset = [0.0, 0.0]
-        self.passive_target = [0.0, 0.0]
+        # CRT optimization: Anti-burn-in jitter
+        self.burnin_offset = [0.0, 0.0]
+        self.burnin_timer = 0.0
         self.passive_timer = 0.0
         self.sweep = None
         self.proximity_zone = "far"
@@ -508,7 +513,8 @@ class Face:
         self.blinking = True
         self.blink_timer = 0.0
         if length is None:
-            self.blink_length = 0.26 if slow else 0.15
+            # CRT optimization: Slower blinks (was 0.26/0.15)
+            self.blink_length = 0.35 if slow else 0.25
         else:
             self.blink_length = max(0.08, float(length))
         self.blink_interval = random.uniform(3.0, 4.5) if slow else random.uniform(2.4, 4.2)
@@ -784,6 +790,14 @@ class Face:
                 self.sweep = None
                 self.passive_timer = max(self.passive_timer, 0.45)
 
+        # CRT optimization: Update burn-in prevention offset
+        self.burnin_timer += dt
+        if self.burnin_timer > 5.0:  # Change offset every 5 seconds
+            self.burnin_offset[0] = random.uniform(-2, 2)
+            self.burnin_offset[1] = random.uniform(-2, 2)
+            self.burnin_timer = 0.0
+        
+        # Passive animation
         self.passive_timer = max(0.0, self.passive_timer - dt)
         target = self.passive_target if (self.passive_timer > 0.0 or self.sweep) else [0.0, 0.0]
         for i in (0, 1):
@@ -826,17 +840,18 @@ class Face:
         self.right_eye_closed = left_eye_ear < 0.2  # User's left eye -> Zeni's right
 
     def _update_head_motion(self, dt):
+        # CRT optimization: Slower smoothing for less ghosting (reduced multipliers)
         # Smooth scale
         diff = self.target_scale - self.current_scale
-        self.current_scale += diff * min(1.0, dt * 2.5)
+        self.current_scale += diff * min(1.0, dt * 1.5)  # Was 2.5
         
         # Smooth roll
         dr = self.target_roll - self.current_roll
-        self.current_roll += dr * min(1.0, dt * 3.0)
+        self.current_roll += dr * min(1.0, dt * 2.0)  # Was 3.0
 
         # Smooth mouth openness
         dm = self.target_mouth_open - self.current_mouth_open
-        self.current_mouth_open += dm * min(1.0, dt * 4.0)
+        self.current_mouth_open += dm * min(1.0, dt * 3.0)  # Was 4.0
         
         jitter = 5 if self.talking else 2
         cooldown = 0.25 if self.talking else 0.7
@@ -934,8 +949,8 @@ class Face:
             self.shadow_expression, self.EXPRESSION_STYLES["neutral"]
         )
         base_center = (
-            WIDTH // 2 + int(self.head_offset[0] + self.passive_offset[0]),
-            HEIGHT // 2 + int(self.head_offset[1] + self.passive_offset[1]),
+            WIDTH // 2 + int(self.head_offset[0] + self.passive_offset[0] + self.burnin_offset[0]),
+            HEIGHT // 2 + int(self.head_offset[1] + self.passive_offset[1] + self.burnin_offset[1]),
         )
         center = base_center
         shadow_center = (
@@ -986,7 +1001,8 @@ class Face:
         face_size = int(radius * 3)  # Large enough to contain rotated face
         temp_surf = pygame.Surface((face_size, face_size), pygame.SRCALPHA)
         temp_center = (face_size // 2, face_size // 2)
-        face_val = max(90, min(170, int(pulse * 1.3)))
+        # CRT optimization: Much brighter face for visibility on CRT
+        face_val = max(180, min(220, int(pulse * 2.0)))
 
         if self.signal_active:
             distort = random.randint(-6, 6)
@@ -1021,7 +1037,17 @@ class Face:
             self._apply_post_glitch_effects(surf)
         
         self._apply_ambient_noise(surf)
+        # CRT optimization: Add scanlines for authentic CRT look
+        self._apply_scanlines(surf)
         self.previous_frame = surf.copy()
+
+    def _apply_scanlines(self, surf):
+        """Add horizontal scanlines to simulate CRT display"""
+        scanline_surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        # Draw every 3rd line as a subtle dark scanline
+        for y in range(0, HEIGHT, 3):
+            pygame.draw.line(scanline_surf, (0, 0, 0, 30), (0, y), (WIDTH, y), 1)
+        surf.blit(scanline_surf, (0, 0))
 
     def _draw_shadow_face(self, surf, center, style, base_radius):
         layer = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -1152,42 +1178,24 @@ class Face:
     def _apply_ambient_noise(self, surf):
         """Subtle persistent visual artifacts to make it feel unstable"""
         mic_factor = min(1.0, self.input_level * 12.0)
-        noise_intensity = 0.15 + 0.3 * mic_factor + 0.18 * math.sin(self.noise_timer * 0.8)
+        # CRT optimization: Reduce noise intensity (was 0.15 + 0.3)
+        noise_intensity = 0.05 + 0.1 * mic_factor + 0.06 * math.sin(self.noise_timer * 0.8)
         
-        num_artifacts = int(25 * noise_intensity)
+        # CRT optimization: Fewer artifacts (was 25)
+        num_artifacts = int(10 * noise_intensity)
         for _ in range(num_artifacts):
             x = random.randint(0, WIDTH)
             y = random.randint(0, HEIGHT)
             brightness = random.randint(40, 100)
             pygame.draw.circle(surf, (brightness, brightness, brightness), (x, y), 1)
         
-        if random.random() < 0.05:
-            edge = random.choice(['top', 'bottom', 'left', 'right'])
-            length = random.randint(20, 80)
-            thickness = random.randint(1, 3)
-            brightness = random.randint(100, 180)
-            color = (brightness, brightness, brightness)  # Pure grayscale for B&W TV
-            
-            if edge == 'top':
-                x = random.randint(0, WIDTH - length)
-                pygame.draw.line(surf, color, (x, 0), (x + length, 0), thickness)
-            elif edge == 'bottom':
-                x = random.randint(0, WIDTH - length)
-                pygame.draw.line(surf, color, (x, HEIGHT - 1), (x + length, HEIGHT - 1), thickness)
-            elif edge == 'left':
-                y = random.randint(0, HEIGHT - length)
-                pygame.draw.line(surf, color, (0, y), (0, y + length), thickness)
-            elif edge == 'right':
-                y = random.randint(0, HEIGHT - length)
-                pygame.draw.line(surf, color, (WIDTH - 1, y), (WIDTH - 1, y + length), thickness)
+        # CRT optimization: Disable edge artifacts - too small for CRT
+        # if random.random() < 0.05:
+        #     ...
         
-        if random.random() < 0.02:
-            num_dead_pixels = random.randint(3, 10)
-            for _ in range(num_dead_pixels):
-                x = random.randint(0, WIDTH)
-                y = random.randint(0, HEIGHT)
-                color = random.choice([(0, 0, 0), (255, 255, 255), (100, 100, 100)])  # Grayscale only
-                pygame.draw.rect(surf, color, pygame.Rect(x, y, 2, 2))
+        # CRT optimization: Disable dead pixels - too small for CRT  
+        # if random.random() < 0.02:
+        #     ...
         
         if self.input_level > 0.02:
             band_count = int(4 + self.input_level * 14)
@@ -1215,7 +1223,7 @@ class Face:
             band_surface.set_alpha(max(80, int(120 * mic_factor)))
             surf.blit(band_surface, (0, 0))
     
-    def _draw_eyes(self, surf, center, style, color=(220, 220, 240)):
+    def _draw_eyes(self, surf, center, style, color=(255, 255, 255)):  # Pure white for CRT
         scale = self.current_scale
         base_y_offset = (style.get("eye_drop", 0) - 107) * scale
         eye_y = center[1] + base_y_offset
@@ -1227,7 +1235,7 @@ class Face:
 
         # Handle individual eye closures (winking) or full blink
         if self.blinking or self.left_eye_closed or self.right_eye_closed:
-            h = 4
+            h = 8  # CRT optimization: Thicker lines (was 4)
             for sign in (-1, 1):
                 # Check if this specific eye should be closed
                 should_close = self.blinking  # Both eyes if blinking
@@ -1266,7 +1274,7 @@ class Face:
                 color,
                 (int(lx - brow_len // 2), int(ly_pos + tilt)),
                 (int(lx + brow_len // 2), int(ly_pos)),
-                3,
+                6,  # CRT optimization: Thicker brow (was 3)
             )
 
             rx = int(center[0] + eye_offset_x)
@@ -1276,7 +1284,7 @@ class Face:
                 color,
                 (int(rx - brow_len // 2), int(ry_pos)),
                 (int(rx + brow_len // 2), int(ry_pos + tilt)),
-                3,
+                6,  # CRT optimization: Thicker brow (was 3)
             )
 
         for sign in (-1, 1):
@@ -1339,7 +1347,7 @@ class Face:
              
         return targets
 
-    def _draw_mouth(self, surf, center, style, talk_override=None, color=(220, 220, 240)):
+    def _draw_mouth(self, surf, center, style, talk_override=None, color=(255, 255, 255)):  # Pure white for CRT
         scale = self.current_scale
         m = style.get("mouth", "flat")
         width = style.get("mouth_width", 90) * scale
@@ -1365,11 +1373,11 @@ class Face:
             # Raise it higher and keep asymmetric positioning
             offset_y = int(height * -0.3)  # Negative to raise it up
             rect = pygame.Rect(int(center[0] - wider_width), int(y - taller_height + offset_y), int(wider_width * 2), int(taller_height * 2))
-            # Draw thicker line for more intensity
-            pygame.draw.arc(surf, color, rect, 3.24, 6.1, 7)
+            # CRT optimization: Thicker line (was 7)
+            pygame.draw.arc(surf, color, rect, 3.24, 6.1, 10)
         elif m == "frown":
             rect = pygame.Rect(int(center[0] - width), int(y - int(height * 0.8)), int(width * 2), int(height * 1.8))
-            pygame.draw.arc(surf, color, rect, 0.15, 2.99, 5)
+            pygame.draw.arc(surf, color, rect, 0.15, 2.99, 8)  # CRT optimization: Thicker (was 5)
         elif m == "line":
             pygame.draw.rect(
                 surf,
@@ -1379,7 +1387,7 @@ class Face:
             )
         elif m == "o":
             r = max(37, int(48 + talk * 53))
-            pygame.draw.circle(surf, color, (int(center[0]), int(y + 10)), int(r), 3)
+            pygame.draw.circle(surf, color, (int(center[0]), int(y + 10)), int(r), 6)  # CRT optimization: Thicker (was 3)
         elif m == "smirk":
             # Simple asymmetric smile - one clean arc shifted to one side
             smirk_offset = int(width * 0.3)
@@ -1389,7 +1397,7 @@ class Face:
                 int(width * 2), 
                 int(height * 1.4)
             )
-            pygame.draw.arc(surf, color, rect, 3.3, 5.95, 5)
+            pygame.draw.arc(surf, color, rect, 3.3, 5.95, 8)  # CRT optimization: Thicker (was 5)
         elif m == "wobble":
             start = center[0] - width
             pts = []
@@ -1806,14 +1814,6 @@ class SoundManager:
         
         # Calculate left/right volumes (pan ranges -1 to 1)
         # Center = balanced. Left = louder left.
-        left_bias = 1.0 - max(0.0, pan)    # pan=1 -> left=0. pan=-1 -> left=1
-        right_bias = 1.0 - max(0.0, -pan)  # pan=1 -> right=1. pan=-1 -> right=0
-        
-        # Smooth bias curve
-        # pan=0 -> l=1, r=1 ? No, that drops center level.
-        # Let's use simple weighting:
-        # center: 0.7, 0.7
-        # left: 1.0, 0.4
         
         base_l = 0.7 - 0.3 * pan
         base_r = 0.7 + 0.3 * pan
@@ -4077,7 +4077,8 @@ def main():
         speak_text(message)
         temp_clock = pygame.time.Clock()
         while pygame.mixer.music.get_busy() and running:
-            dt = temp_clock.tick(60) / 1000.0
+            # CRT optimization: 30 FPS for greeting animation
+            dt = temp_clock.tick(30) / 1000.0
             face.update(dt)
             draw_ui()
             interrupted = False
@@ -4189,7 +4190,8 @@ def main():
     recorder.start_monitoring()
 
     while running:
-        dt = clock.tick(60) / 1000.0
+        # CRT optimization: 30 FPS cap to match interlaced CRT refresh (was 60)
+        dt = clock.tick(30) / 1000.0
         
         # Update soundscape logic
         sound_manager.update(dt)
