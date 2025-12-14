@@ -1001,8 +1001,8 @@ class Face:
         face_size = int(radius * 3)  # Large enough to contain rotated face
         temp_surf = pygame.Surface((face_size, face_size), pygame.SRCALPHA)
         temp_center = (face_size // 2, face_size // 2)
-        # CRT optimization: Much brighter face for visibility on CRT
-        face_val = max(180, min(220, int(pulse * 2.0)))
+        # CRT optimization: Bright face for visibility on CRT (reduced from 180-220)
+        face_val = max(140, min(170, int(pulse * 1.6)))
 
         if self.signal_active:
             distort = random.randint(-6, 6)
