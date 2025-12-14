@@ -52,7 +52,9 @@ DEFAULT_FACE_SCAN_INTERVAL = 20.0
 NAME_FORGET_TIMEOUT = 600.0
 
 pygame.init()
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+# Get actual screen dimensions after fullscreen
+WIDTH, HEIGHT = screen.get_size()
 pygame.display.set_caption("Gerty style avatar")
 clock = pygame.time.Clock()
 pygame.mixer.init()
