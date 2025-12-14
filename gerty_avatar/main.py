@@ -961,26 +961,39 @@ class Face:
 
         self._draw_shadow_face(surf, shadow_center, shadow_style, radius)
 
+        # Create temporary surface for face rotation
+        face_size = int(radius * 3)  # Large enough to contain rotated face
+        temp_surf = pygame.Surface((face_size, face_size), pygame.SRCALPHA)
+        temp_center = (face_size // 2, face_size // 2)
+
         if self.signal_active:
             distort = random.randint(-6, 6)
             distorted_radius = radius + distort
-            pygame.draw.circle(surf, (pulse, pulse, pulse + 20), center, max(120, distorted_radius))
+            pygame.draw.circle(temp_surf, (pulse, pulse, pulse + 20), temp_center, max(120, distorted_radius))
             smear_width = random.randint(4, 10)
-            smear = pygame.Rect(center[0] - radius, center[1] - smear_width // 2, radius * 2, smear_width)
-            pygame.draw.rect(surf, (pulse + 20, pulse, pulse), smear, border_radius=smear_width // 2)
+            smear = pygame.Rect(temp_center[0] - radius, temp_center[1] - smear_width // 2, radius * 2, smear_width)
+            pygame.draw.rect(temp_surf, (pulse + 20, pulse, pulse), smear, border_radius=smear_width // 2)
         else:
-            pygame.draw.circle(surf, (pulse, pulse, pulse + 20), center, radius)
+            pygame.draw.circle(temp_surf, (pulse, pulse, pulse + 20), temp_center, radius)
 
         if self.glitch_active and self.glitch_type == "distort":
             distorted_center = (
-                center[0] + random.randint(-8, 8),
-                center[1] + random.randint(-8, 8)
+                temp_center[0] + random.randint(-8, 8),
+                temp_center[1] + random.randint(-8, 8)
             )
-            self._draw_eyes(surf, distorted_center, style)
-            self._draw_mouth(surf, distorted_center, style)
+            self._draw_eyes(temp_surf, distorted_center, style)
+            self._draw_mouth(temp_surf, distorted_center, style)
         else:
-            self._draw_eyes(surf, center, style)
-            self._draw_mouth(surf, center, style)
+            self._draw_eyes(temp_surf, temp_center, style)
+            self._draw_mouth(temp_surf, temp_center, style)
+        
+        # Rotate the face based on head roll
+        angle_degrees = math.degrees(self.current_roll)  # Positive for mirrored direction
+        rotated_surf = pygame.transform.rotate(temp_surf, angle_degrees)
+        
+        # Calculate position to center the rotated surface
+        rotated_rect = rotated_surf.get_rect(center=center)
+        surf.blit(rotated_surf, rotated_rect.topleft)
         
         if self.glitch_active:
             self._apply_post_glitch_effects(surf)
@@ -1187,14 +1200,14 @@ class Face:
         eye_offset_x = 120 * scale
         base = 48 * style.get("eye_scale", 1.0) * scale
         
-        # Apply roll tilt vertical offset
-        tilt_y = eye_offset_x * math.sin(self.current_roll)
+        
+        # Removed roll tilt vertical offset - eyes stay level
 
         if self.blinking:
             h = 4
             for sign in (-1, 1):
                 x = int(center[0] + sign * eye_offset_x)
-                y_pos = eye_y + sign * tilt_y
+                y_pos = eye_y
                 pygame.draw.rect(
                     surf,
                     color,
@@ -1208,7 +1221,7 @@ class Face:
             tilt = int(base * 0.4)
 
             lx = int(center[0] - eye_offset_x)
-            ly_pos = brow_y - tilt_y
+            ly_pos = brow_y
             pygame.draw.line(
                 surf,
                 color,
@@ -1218,7 +1231,7 @@ class Face:
             )
 
             rx = int(center[0] + eye_offset_x)
-            ry_pos = brow_y + tilt_y
+            ry_pos = brow_y
             pygame.draw.line(
                 surf,
                 color,
@@ -1229,7 +1242,7 @@ class Face:
 
         for sign in (-1, 1):
             x = int(center[0] + sign * eye_offset_x)
-            y_pos = eye_y + sign * tilt_y
+            y_pos = eye_y
             w = int(base * 0.9)
             h = int(base * 1.45)
             rect = pygame.Rect(x - w, int(y_pos - h), w * 2, h * 2)
@@ -1307,8 +1320,14 @@ class Face:
         height = (93 + talk * 80) * scale
 
         if m == "smile":
-            rect = pygame.Rect(int(center[0] - width), int(y - height), int(width * 2), int(height * 2))
-            pygame.draw.arc(surf, color, rect, 3.24, 6.1, 4)
+            # Make it narrower but more pronounced for creepy effect
+            wider_width = int(width * 0.95)  # Narrower than normal
+            taller_height = int(height * 1.8)
+            # Raise it higher and keep asymmetric positioning
+            offset_y = int(height * -0.3)  # Negative to raise it up
+            rect = pygame.Rect(int(center[0] - wider_width), int(y - taller_height + offset_y), int(wider_width * 2), int(taller_height * 2))
+            # Draw thicker line for more intensity
+            pygame.draw.arc(surf, color, rect, 3.24, 6.1, 7)
         elif m == "frown":
             rect = pygame.Rect(int(center[0] - width), int(y - int(height * 0.8)), int(width * 2), int(height * 1.8))
             pygame.draw.arc(surf, color, rect, 0.15, 2.99, 5)
