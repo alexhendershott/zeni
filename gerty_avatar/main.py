@@ -391,6 +391,8 @@ class Face:
         self.blink_interval = 3.0
         self.blink_length = 0.15
         self.blinking = False
+        self.left_eye_closed = False
+        self.right_eye_closed = False
 
         self.talk_timer = 0.0
         self.talk_phase = random.random() * math.tau
@@ -635,14 +637,22 @@ class Face:
         else:
             self.talk_timer = max(0.0, self.talk_timer - dt * 0.4)
 
-        self.blink_timer += dt
-        if not self.blinking and self.blink_timer > self.blink_interval:
-            self.blinking = True
-            self.blink_timer = 0.0
-            self.blink_interval = random.uniform(2.5, 4.5)
-        if self.blinking and self.blink_timer > self.blink_length:
-            self.blinking = False
-            self.blink_timer = 0.0
+        # Automatic blinking disabled - Zeni now only blinks when YOU blink
+        # self.blink_timer += dt
+        # if not self.blinking and self.blink_timer > self.blink_interval:
+        #     self.blinking = True
+        #     self.blink_timer = 0.0
+        #     self.blink_interval = random.uniform(2.5, 4.5)
+        # if self.blinking and self.blink_timer > self.blink_length:
+        #     self.blinking = False
+        #     self.blink_timer = 0.0
+        
+        # Manual blink timer (for user-triggered blinks)
+        if self.blinking:
+            self.blink_timer += dt
+            if self.blink_timer > self.blink_length:
+                self.blinking = False
+                self.blink_timer = 0.0
 
         if self.manual_expression:
             self.manual_timer -= dt
@@ -785,7 +795,7 @@ class Face:
                 if abs(self.passive_offset[i]) < 0.2:
                     self.passive_offset[i] = 0.0
 
-    def update_tracking(self, target_pos, face_size=0.0, roll=0.0, mouth_open=0.0):
+    def update_tracking(self, target_pos, face_size=0.0, roll=0.0, mouth_open=0.0, left_eye_ear=0.3, right_eye_ear=0.3):
         if target_pos is None:
             self.tracking_active = False
             self.target_scale = 1.0
@@ -810,6 +820,10 @@ class Face:
         self.target_scale = max(0.6, min(2.2, raw_scale))
         self.target_roll = roll
         self.target_mouth_open = mouth_open
+        # Individual eye tracking for winking (EAR < 0.2 means closed)
+        # Swap left/right for mirror effect
+        self.left_eye_closed = right_eye_ear < 0.2  # User's right eye -> Zeni's left
+        self.right_eye_closed = left_eye_ear < 0.2  # User's left eye -> Zeni's right
 
     def _update_head_motion(self, dt):
         # Smooth scale
@@ -1211,16 +1225,33 @@ class Face:
         
         # Removed roll tilt vertical offset - eyes stay level
 
-        if self.blinking:
+        # Handle individual eye closures (winking) or full blink
+        if self.blinking or self.left_eye_closed or self.right_eye_closed:
             h = 4
             for sign in (-1, 1):
+                # Check if this specific eye should be closed
+                should_close = self.blinking  # Both eyes if blinking
+                if sign == -1:  # Left eye
+                    should_close = should_close or self.left_eye_closed
+                elif sign == 1:  # Right eye
+                    should_close = should_close or self.right_eye_closed
+                
                 x = int(center[0] + sign * eye_offset_x)
                 y_pos = eye_y
-                pygame.draw.rect(
-                    surf,
-                    color,
-                    pygame.Rect(int(x - base), int(y_pos - 2), int(base * 2), int(h)),
-                )
+                
+                if should_close:
+                    # Draw closed eye (horizontal line)
+                    pygame.draw.rect(
+                        surf,
+                        color,
+                        pygame.Rect(int(x - base), int(y_pos - 2), int(base * 2), int(h)),
+                    )
+                else:
+                    # Draw open eye (ellipse)
+                    w = int(base * 0.9)
+                    h_open = int(base * 1.45)
+                    rect = pygame.Rect(x - w, int(y_pos - h_open), w * 2, h_open * 2)
+                    pygame.draw.ellipse(surf, color, rect)
             return
 
         if self.expression == "thinking":
@@ -2525,6 +2556,8 @@ class LandmarkGazeTracker:
         self.face_size = 0.0
         self.roll = 0.0
         self.mouth_openness = 0.0
+        self.left_eye_ear = 0.3  # Eye aspect ratio for left eye
+        self.right_eye_ear = 0.3  # Eye aspect ratio for right eye
         self.mouth_active = False
         self.blink_start = None
         self.squint_timer = 0.0
@@ -2609,6 +2642,8 @@ class LandmarkGazeTracker:
                 "face_size": self.face_size,
                 "roll": self.roll,
                 "mouth_open": self.mouth_openness,
+                "left_eye_ear": self.left_eye_ear,
+                "right_eye_ear": self.right_eye_ear,
             }
         return events, state
 
@@ -2683,8 +2718,11 @@ class LandmarkGazeTracker:
             in_contact = contact_conf > 0.3 and self.contact_ema > 0.35
             self._update_contact(in_contact, now)
 
-            ear = self._average_ear(pts)
+            ear, left_ear, right_ear = self._average_ear(pts)
             self._update_blinks(ear, now)
+            # Store individual eye states for winking detection
+            self.left_eye_ear = left_ear
+            self.right_eye_ear = right_ear
 
             mar = self._mouth_aspect_ratio(pts)
             self._update_mouth(mar, now)
@@ -2800,9 +2838,9 @@ class LandmarkGazeTracker:
         try:
             left = self._eye_aspect_ratio(pts, self.LEFT_EYE)
             right = self._eye_aspect_ratio(pts, self.RIGHT_EYE)
-            return (left + right) * 0.5
+            return (left + right) * 0.5, left, right  # Return average, left, right
         except Exception:
-            return 0.0
+            return 0.0, 0.0, 0.0
 
     def _mouth_aspect_ratio(self, pts):
         try:
@@ -4291,7 +4329,9 @@ def main():
                 gaze_state.get("user_position"), 
                 face_size=gaze_state.get("face_size", 0.0),
                 roll=f_roll,
-                mouth_open=f_mouth
+                mouth_open=f_mouth,
+                left_eye_ear=gaze_state.get("left_eye_ear", 0.3),
+                right_eye_ear=gaze_state.get("right_eye_ear", 0.3)
             )
         else:
             face.update_tracking(None)
