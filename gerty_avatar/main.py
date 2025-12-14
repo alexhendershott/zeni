@@ -365,17 +365,17 @@ class ParticleSystem:
 
 class Face:
     EXPRESSION_STYLES = {
-        "neutral":   {"mouth": "flat", "mouth_width": 90, "eye_drop": 0,  "eye_scale": 1.0},
-        "happy":     {"mouth": "smile", "mouth_width": 95, "eye_drop": -2, "eye_scale": 1.0},
-        "excited":   {"mouth": "smile", "mouth_width": 125, "eye_drop": -4, "eye_scale": 1.15},
-        "curious":   {"mouth": "smirk", "mouth_width": 85, "eye_drop": -4, "eye_scale": 0.95},
-        "confused":  {"mouth": "wobble", "mouth_width": 90, "eye_drop": 2,  "eye_scale": 0.95},
-        "sad":       {"mouth": "frown", "mouth_width": 100, "eye_drop": 6,  "eye_scale": 0.88},
-        "concerned": {"mouth": "flat", "mouth_width": 95, "eye_drop": 3,  "eye_scale": 0.92},
-        "surprised": {"mouth": "o",     "mouth_width": 80, "eye_drop": -6, "eye_scale": 1.15},
+        "neutral":   {"mouth": "flat", "mouth_width": 240, "eye_drop": 0,  "eye_scale": 1.0},
+        "happy":     {"mouth": "smile", "mouth_width": 253, "eye_drop": -2, "eye_scale": 1.0},
+        "excited":   {"mouth": "smile", "mouth_width": 333, "eye_drop": -4, "eye_scale": 1.15},
+        "curious":   {"mouth": "smirk", "mouth_width": 226, "eye_drop": -4, "eye_scale": 0.95},
+        "confused":  {"mouth": "wobble", "mouth_width": 240, "eye_drop": 2,  "eye_scale": 0.95},
+        "sad":       {"mouth": "frown", "mouth_width": 266, "eye_drop": 6,  "eye_scale": 0.88},
+        "concerned": {"mouth": "flat", "mouth_width": 253, "eye_drop": 3,  "eye_scale": 0.92},
+        "surprised": {"mouth": "o",     "mouth_width": 213, "eye_drop": -6, "eye_scale": 1.15},
         "thinking":  {
             "mouth": "thinking",
-            "mouth_width": 80,
+            "mouth_width": 213,
             "eye_drop": -2,
             "eye_scale": 1.05,
         },
@@ -916,7 +916,7 @@ class Face:
             base_center[0] + int(self.shadow_offset[0]),
             base_center[1] + int(self.shadow_offset[1]),
         )
-        radius = 140 * self.current_scale
+        radius = 373 * self.current_scale
 
         base = 28
         pulse_speed = 3.2 if self.talking else 1.6
@@ -1182,10 +1182,10 @@ class Face:
     
     def _draw_eyes(self, surf, center, style, color=(220, 220, 240)):
         scale = self.current_scale
-        base_y_offset = (style.get("eye_drop", 0) - 40) * scale
+        base_y_offset = (style.get("eye_drop", 0) - 107) * scale
         eye_y = center[1] + base_y_offset
-        eye_offset_x = 45 * scale
-        base = 18 * style.get("eye_scale", 1.0) * scale
+        eye_offset_x = 120 * scale
+        base = 48 * style.get("eye_scale", 1.0) * scale
         
         # Apply roll tilt vertical offset
         tilt_y = eye_offset_x * math.sin(self.current_roll)
@@ -1294,7 +1294,7 @@ class Face:
         if self.talking:
             width *= 1.0 + 0.08 * math.sin(self.talk_timer * 5.3 + self.talk_phase)
         width = int(width)
-        y = center[1] + 40 * scale
+        y = center[1] + 107 * scale
         talk = self._talk_amount() if talk_override is None else talk_override
         
         # Mimicry: Add mouth opening
@@ -1304,7 +1304,7 @@ class Face:
             if self.current_mouth_open > 0.4 and not self.talking:
                 m = "o"
 
-        height = (35 + talk * 30) * scale
+        height = (93 + talk * 80) * scale
 
         if m == "smile":
             rect = pygame.Rect(int(center[0] - width), int(y - height), int(width * 2), int(height * 2))
@@ -1320,7 +1320,7 @@ class Face:
                 border_radius=4,
             )
         elif m == "o":
-            r = max(14, int(18 + talk * 20))
+            r = max(37, int(48 + talk * 53))
             pygame.draw.circle(surf, color, (int(center[0]), int(y + 10)), int(r), 3)
         elif m == "smirk":
             # Simple asymmetric smile - one clean arc shifted to one side
