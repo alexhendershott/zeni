@@ -705,6 +705,7 @@ class Face:
         ):
             self._trigger_signal_loss()
         
+        # Increased glitch frequency for more dramatic effects
         self.glitch_timer -= dt
         if self.glitch_active:
             self.glitch_duration -= dt
@@ -712,6 +713,10 @@ class Face:
                 self.glitch_active = False
                 self.glitch_type = None
                 self.glitch_timer = random.uniform(3.0, 8.0)
+        elif not self.glitch_active and random.random() < 0.015:  # Was 0.008, now ~2x more frequent
+            self.glitch_active = True
+            self.glitch_timer = 0.0
+            self.glitch_duration = random.uniform(0.25, 0.6)  # Was 0.15-0.4, now longer
         elif self.glitch_timer <= 0:
             self._trigger_glitch()
         
@@ -1022,9 +1027,10 @@ class Face:
             pygame.draw.circle(temp_surf, (face_val, face_val, face_val), temp_center, int(radius))
 
         if self.glitch_active and self.glitch_type == "distort":
+            # Increased distortion for more dramatic effect
             distorted_center = (
-                temp_center[0] + random.randint(-8, 8),
-                temp_center[1] + random.randint(-8, 8)
+                temp_center[0] + random.randint(-15, 15),  # Was -8, 8
+                temp_center[1] + random.randint(-15, 15),  # Was -8, 8
             )
             self._draw_eyes(temp_surf, distorted_center, style)
             self._draw_mouth(temp_surf, distorted_center, style)
@@ -1115,13 +1121,17 @@ class Face:
     def _apply_post_glitch_effects(self, surf):
         """Apply post-render glitch effects over the face"""
         if self.glitch_type == "chromatic":
-            shift = int(6 * self.glitch_intensity)
-            temp_surf = surf.copy()
-            red_channel = pygame.Surface((WIDTH, HEIGHT))
-            red_channel.fill((0, 0, 0))
-            red_channel.blit(temp_surf, (shift, 0))
-            red_channel.set_colorkey((0, 0, 0))
-            surf.blit(red_channel, (-shift, 0))
+            # Increased chromatic aberration for more dramatic RGB split
+            offset = random.randint(6, 12)  # Was 3-6, now 2x stronger
+            r_surf = surf.copy()
+            b_surf = surf.copy()
+            r_arr = pygame.surfarray.pixels3d(r_surf)
+            b_arr = pygame.surfarray.pixels3d(b_surf)
+            r_arr[:, :, 1:] = 0
+            b_arr[:, :, :2] = 0
+            del r_arr, b_arr
+            surf.blit(r_surf, (offset, 0), special_flags=pygame.BLEND_RGB_ADD)
+            surf.blit(b_surf, (-offset, 0), special_flags=pygame.BLEND_RGB_ADD)
         
         elif self.glitch_type == "corrupt":
             num_bars = int(8 * self.glitch_intensity)
@@ -3853,7 +3863,7 @@ def main():
         dreams.render(screen)
 
         text_surface = FONT.render(status_text, True, (220, 220, 240))
-        screen.blit(text_surface, (20, HEIGHT - 40))
+        screen.blit(text_surface, (SAFE_OFFSET_X + 20, HEIGHT - SAFE_OFFSET_Y - 40))
 
         # Vision indicator (top-right)
         indicator_text = "VISION OFF"
