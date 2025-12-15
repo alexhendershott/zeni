@@ -1405,7 +1405,7 @@ class Face:
                 t = i / 11.0
                 x = start + t * width * 2
                 yy = y + math.sin(self.talk_timer * 8.0 + t * math.pi * 2) * (8 + talk * 12)
-                pts.append((x, yy))
+                pts.append((int(x), int(yy)))
             pygame.draw.lines(surf, color, False, pts, 4)
         elif m == "thinking":
             arc_h = int(height * 0.7)
