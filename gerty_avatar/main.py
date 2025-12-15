@@ -1007,12 +1007,12 @@ class Face:
         if self.signal_active:
             distort = random.randint(-6, 6)
             distorted_radius = radius + distort
-            pygame.draw.circle(temp_surf, (face_val, face_val, face_val), temp_center, max(120, distorted_radius))
+            pygame.draw.circle(temp_surf, (face_val, face_val, face_val), temp_center, int(max(120, distorted_radius)))
             smear_width = random.randint(4, 10)
-            smear = pygame.Rect(temp_center[0] - radius, temp_center[1] - smear_width // 2, radius * 2, smear_width)
+            smear = pygame.Rect(int(temp_center[0] - radius), int(temp_center[1] - smear_width // 2), int(radius * 2), int(smear_width))
             pygame.draw.rect(temp_surf, (face_val, face_val, face_val), smear, border_radius=smear_width // 2)
         else:
-            pygame.draw.circle(temp_surf, (face_val, face_val, face_val), temp_center, radius)
+            pygame.draw.circle(temp_surf, (face_val, face_val, face_val), temp_center, int(radius))
 
         if self.glitch_active and self.glitch_type == "distort":
             distorted_center = (
@@ -1059,8 +1059,8 @@ class Face:
         core_gray = min(190, glow_base + 35)
         core_color = (core_gray, core_gray, core_gray, 200)
 
-        pygame.draw.circle(layer, glow_color, center, radius + 12)
-        pygame.draw.circle(layer, core_color, center, radius)
+        pygame.draw.circle(layer, glow_color, center, int(radius + 12))
+        pygame.draw.circle(layer, core_color, center, int(radius))
 
         echo_gray = min(200, glow_base + 60)
         echo_color = (echo_gray, echo_gray, echo_gray)
@@ -1252,13 +1252,13 @@ class Face:
                     pygame.draw.rect(
                         surf,
                         color,
-                        pygame.Rect(int(x - base), int(y_pos - 2), int(base * 2), int(h)),
+                        pygame.Rect(int(x - base), int(y_pos - 2), int(base * 2), h),
                     )
                 else:
                     # Draw open eye (ellipse)
                     w = int(base * 0.9)
                     h_open = int(base * 1.45)
-                    rect = pygame.Rect(x - w, int(y_pos - h_open), w * 2, h_open * 2)
+                    rect = pygame.Rect(int(x - w), int(y_pos - h_open), int(w * 2), int(h_open * 2))
                     pygame.draw.ellipse(surf, color, rect)
             return
 
@@ -1292,7 +1292,7 @@ class Face:
             y_pos = eye_y
             w = int(base * 0.9)
             h = int(base * 1.45)
-            rect = pygame.Rect(x - w, int(y_pos - h), w * 2, h * 2)
+            rect = pygame.Rect(int(x - w), int(y_pos - h), int(w * 2), int(h * 2))
             pygame.draw.ellipse(surf, color, rect)
 
     def _talk_amount(self):
@@ -1376,7 +1376,7 @@ class Face:
             # CRT optimization: Thicker line (was 7)
             pygame.draw.arc(surf, color, rect, 3.24, 6.1, 10)
         elif m == "frown":
-            rect = pygame.Rect(int(center[0] - width), int(y - int(height * 0.8)), int(width * 2), int(height * 1.8))
+            rect = pygame.Rect(int(center[0] - width), int(y - height * 0.8), int(width * 2), int(height * 1.8))
             pygame.draw.arc(surf, color, rect, 0.15, 2.99, 8)  # CRT optimization: Thicker (was 5)
         elif m == "line":
             pygame.draw.rect(
@@ -1392,8 +1392,8 @@ class Face:
             # Simple asymmetric smile - one clean arc shifted to one side
             smirk_offset = int(width * 0.3)
             rect = pygame.Rect(
-                int(center[0] - width + smirk_offset), 
-                int(y - int(height * 0.6)), 
+                int(center[0] - smirk_offset - width), 
+                int(y - height * 0.7),
                 int(width * 2), 
                 int(height * 1.4)
             )
@@ -1409,11 +1409,11 @@ class Face:
             pygame.draw.lines(surf, color, False, pts, 4)
         elif m == "thinking":
             arc_h = int(height * 0.7)
-            rect = pygame.Rect(int(center[0] - width), int(y - arc_h // 3), int(width * 2), arc_h)
+            rect = pygame.Rect(int(center[0] - width), int(y - arc_h // 3), int(width * 2), int(arc_h))
             pygame.draw.arc(surf, color, rect, 3.4, 5.9, 4)
         else:
             arc_h = int(height * 0.6)
-            rect = pygame.Rect(center[0] - width, y - arc_h, width * 2, arc_h * 2)
+            rect = pygame.Rect(int(center[0] - width), int(y - arc_h), int(width * 2), int(arc_h * 2))
             pygame.draw.arc(surf, color, rect, 3.4, 5.8, 4)
 
 class DreamMonologue:
