@@ -1904,8 +1904,8 @@ class AudioRecorder:
         self._started_at = 0.0
         self._level = 0.0
 
-        # VAD settings
-        self.vad_enabled = False
+        # VAD settings - enabled by default for hands-free operation
+        self.vad_enabled = True  # Changed from False to start with VAD on
         self.vad_threshold = 0.015
         self.silence_timeout = 1.0  # seconds of silence before stop
         self.pre_roll_duration = 0.6
