@@ -1912,6 +1912,11 @@ class AudioRecorder:
         self._pre_roll = deque(maxlen=int(self.samplerate * self.pre_roll_duration / 1024))
         self.silence_timer = 0.0
         self.monitoring = False
+        
+        # Audio feedback prevention - suspend VAD while speaking
+        self.is_speaking = False
+        self.speak_cooldown = 0.0
+        self.speak_cooldown_duration = 1.0  # Wait 1 second after speaking before listening
 
     def _callback(self, indata, frames, time_info, status):
         if status:
@@ -1952,10 +1957,29 @@ class AudioRecorder:
         if not self._stream:
             return None
         
+        # Audio feedback prevention: Check if TTS is playing
+        tts_is_playing = pygame.mixer.music.get_busy()
+        
+        # Update speaking state and cooldown
+        if tts_is_playing:
+            self.is_speaking = True
+            self.speak_cooldown = self.speak_cooldown_duration
+        elif self.is_speaking:
+            # TTS just stopped, start cooldown
+            self.is_speaking = False
+        
+        # Decrease cooldown timer
+        if self.speak_cooldown > 0:
+            self.speak_cooldown -= dt
+        
+        # Suspend VAD if speaking or in cooldown period
+        vad_suspended = self.is_speaking or self.speak_cooldown > 0
+        
         is_loud = self._level > self.vad_threshold
 
         if not self.recording:
-            if self.vad_enabled and is_loud:
+            # Only trigger VAD if not suspended (not speaking/cooldown)
+            if self.vad_enabled and is_loud and not vad_suspended:
                 self.start_capture()
                 return "started"
         else:
