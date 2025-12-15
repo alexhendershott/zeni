@@ -62,6 +62,13 @@ pygame.display.set_caption("Gerty style avatar")
 clock = pygame.time.Clock()
 pygame.mixer.init()
 
+# CRT overscan safe area - 10% margin on all sides
+OVERSCAN_MARGIN = 0.10
+SAFE_WIDTH = int(WIDTH * (1 - OVERSCAN_MARGIN * 2))
+SAFE_HEIGHT = int(HEIGHT * (1 - OVERSCAN_MARGIN * 2))
+SAFE_OFFSET_X = int(WIDTH * OVERSCAN_MARGIN)
+SAFE_OFFSET_Y = int(HEIGHT * OVERSCAN_MARGIN)
+
 FONT = pygame.font.SysFont("Arial", 24)
 SMALL_FONT = pygame.font.SysFont("Arial", 18)
 GREETING_MESSAGES = [
@@ -818,12 +825,12 @@ class Face:
             return
         self.tracking_active = True
         
-        # Exaggerate motion:
+        # Exaggerate motion - increased for more extreme tracking
         # User is at -1..1. Screen width 640.
-        # Let's allow head to move +/- 180 pixels.
+        # Increased from ±180 to ±280 pixels for more dramatic movement
         # INVERT scale_x so Zeni moves opposite to user (following feeling)
-        scale_x = -180.0
-        scale_y = 90.0
+        scale_x = -280.0  # Was -180.0
+        scale_y = 120.0   # Was 90.0
         self.tracking_target = [target_pos[0] * scale_x, target_pos[1] * scale_y]
         
         # Calibrate size
@@ -840,14 +847,14 @@ class Face:
         self.right_eye_closed = left_eye_ear < 0.2  # User's left eye -> Zeni's right
 
     def _update_head_motion(self, dt):
-        # CRT optimization: Slower smoothing for less ghosting (reduced multipliers)
+        # CRT optimization: Faster smoothing for more responsive tracking (increased from slower values)
         # Smooth scale
         diff = self.target_scale - self.current_scale
-        self.current_scale += diff * min(1.0, dt * 1.5)  # Was 2.5
+        self.current_scale += diff * min(1.0, dt * 3.0)  # Was 1.5, now faster
         
-        # Smooth roll
+        # Smooth roll - increased for more dramatic head tilt
         dr = self.target_roll - self.current_roll
-        self.current_roll += dr * min(1.0, dt * 2.0)  # Was 3.0
+        self.current_roll += dr * min(1.0, dt * 4.0)  # Was 2.0, now much faster
 
         # Smooth mouth openness
         dm = self.target_mouth_open - self.current_mouth_open
@@ -949,8 +956,8 @@ class Face:
             self.shadow_expression, self.EXPRESSION_STYLES["neutral"]
         )
         base_center = (
-            WIDTH // 2 + int(self.head_offset[0] + self.passive_offset[0] + self.burnin_offset[0]),
-            HEIGHT // 2 + int(self.head_offset[1] + self.passive_offset[1] + self.burnin_offset[1]),
+            SAFE_OFFSET_X + SAFE_WIDTH // 2 + int(self.head_offset[0] + self.passive_offset[0] + self.burnin_offset[0]),
+            SAFE_OFFSET_Y + SAFE_HEIGHT // 2 + int(self.head_offset[1] + self.passive_offset[1] + self.burnin_offset[1]),
         )
         center = base_center
         shadow_center = (
@@ -3870,7 +3877,7 @@ def main():
                 age = now - last_seen
                 indicator_text += f" ({age:0.1f}s)"
         indicator = SMALL_FONT.render(indicator_text, True, indicator_color)
-        ind_rect = indicator.get_rect(topright=(WIDTH - 16, 12))
+        ind_rect = indicator.get_rect(topright=(WIDTH - SAFE_OFFSET_X - 16, SAFE_OFFSET_Y + 12))
         pygame.draw.circle(screen, indicator_color, (ind_rect.left - 10, ind_rect.centery), 6)
         screen.blit(indicator, ind_rect)
         
@@ -3882,7 +3889,7 @@ def main():
             vad_text = "REC"
         
         vad_ind = SMALL_FONT.render(vad_text, True, vad_color)
-        vad_rect = vad_ind.get_rect(topright=(WIDTH - 16, 36))
+        vad_rect = vad_ind.get_rect(topright=(WIDTH - SAFE_OFFSET_X - 16, SAFE_OFFSET_Y + 36))
         pygame.draw.circle(screen, vad_color, (vad_rect.left - 10, vad_rect.centery), 6)
         screen.blit(vad_ind, vad_rect)
         screen.blit(indicator, ind_rect)
