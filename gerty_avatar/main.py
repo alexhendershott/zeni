@@ -1980,15 +1980,18 @@ class AudioRecorder:
         if not self._stream:
             return None
         
-        # Audio feedback prevention: Check if TTS is playing
+        # Audio feedback prevention: Check if ANY audio is playing (TTS or ambient sounds)
         tts_is_playing = pygame.mixer.music.get_busy()
+        # Check if any sound channels are playing (ambient drone, etc.)
+        any_channel_playing = any(pygame.mixer.Channel(i).get_busy() for i in range(pygame.mixer.get_num_channels()))
+        audio_is_playing = tts_is_playing or any_channel_playing
         
         # Update speaking state and cooldown
-        if tts_is_playing:
+        if audio_is_playing:
             self.is_speaking = True
             self.speak_cooldown = self.speak_cooldown_duration
         elif self.is_speaking:
-            # TTS just stopped, start cooldown
+            # Audio just stopped, start cooldown
             self.is_speaking = False
         
         # Decrease cooldown timer
