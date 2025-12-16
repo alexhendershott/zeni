@@ -1906,7 +1906,7 @@ class AudioRecorder:
 
         # VAD settings - enabled by default for hands-free operation
         self.vad_enabled = True  # Changed from False to start with VAD on
-        self.vad_threshold = 0.030  # Increased from 0.015 to ignore CRT static/noise
+        self.vad_threshold = 0.050  # Increased from 0.030 - very high to ignore CRT static
         self.silence_timeout = 1.0  # seconds of silence before stop
         self.pre_roll_duration = 0.6
         self._pre_roll = deque(maxlen=int(self.samplerate * self.pre_roll_duration / 1024))
