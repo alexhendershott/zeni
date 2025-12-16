@@ -1906,12 +1906,17 @@ class AudioRecorder:
 
         # VAD settings - enabled by default for hands-free operation
         self.vad_enabled = True  # Changed from False to start with VAD on
-        self.vad_threshold = 0.015
+        self.vad_threshold = 0.030  # Increased from 0.015 to ignore CRT static/noise
         self.silence_timeout = 1.0  # seconds of silence before stop
         self.pre_roll_duration = 0.6
         self._pre_roll = deque(maxlen=int(self.samplerate * self.pre_roll_duration / 1024))
         self.silence_timer = 0.0
         self.monitoring = False
+        
+        # Frequency-based noise filtering for CRT interference
+        self.use_frequency_filter = True
+        self.voice_freq_min = 85  # Hz - lowest human voice fundamental
+        self.voice_freq_max = 3000  # Hz - upper range for speech clarity
         
         # Audio feedback prevention - suspend VAD while speaking
         self.is_speaking = False
@@ -1922,8 +1927,26 @@ class AudioRecorder:
         if status:
             print("Audio status:", status)
         
-        # Calculate level for all frames
-        current_peak = float(np.max(np.abs(indata))) if indata.size else 0.0
+        # Calculate level with optional frequency filtering for CRT noise rejection
+        if self.use_frequency_filter and indata.size > 0:
+            # Apply FFT to get frequency spectrum
+            audio_mono = indata.flatten()
+            fft = np.fft.rfft(audio_mono)
+            freqs = np.fft.rfftfreq(len(audio_mono), 1.0 / self.samplerate)
+            
+            # Filter to only human voice frequencies (85-3000 Hz)
+            # This rejects 60Hz hum and high-frequency CRT whine
+            voice_mask = (freqs >= self.voice_freq_min) & (freqs <= self.voice_freq_max)
+            fft_filtered = fft.copy()
+            fft_filtered[~voice_mask] = 0
+            
+            # Convert back to time domain and calculate level
+            filtered_audio = np.fft.irfft(fft_filtered, len(audio_mono))
+            current_peak = float(np.max(np.abs(filtered_audio)))
+        else:
+            # Simple peak detection without filtering
+            current_peak = float(np.max(np.abs(indata))) if indata.size else 0.0
+        
         self._level = max(current_peak, self._level * 0.8)
 
         with self._lock:
